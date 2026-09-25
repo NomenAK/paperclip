@@ -328,7 +328,12 @@ export function projectRoutes(db: Db) {
     const body = { ...req.body };
     assertNoAgentHostWorkspaceCommandMutation(
       req,
-      collectProjectExecutionWorkspaceCommandPaths(body.executionWorkspacePolicy),
+      [
+        ...collectProjectExecutionWorkspaceCommandPaths(body.executionWorkspacePolicy),
+        ...(body.executionWorkspacePolicy !== undefined
+          ? collectProjectExecutionWorkspaceCommandPaths(existing.executionWorkspacePolicy)
+          : []),
+      ],
     );
     await assertProjectEnvironmentSelection(
       existing.companyId,
