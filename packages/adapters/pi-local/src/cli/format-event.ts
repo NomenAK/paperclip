@@ -1,107 +1,53 @@
 import pc from "picocolors";
+import { parsePiStdoutLine } from "../ui/parse-stdout.js";
 
-function safeJsonParse(text: string): unknown {
+function formatJson(value: unknown): string {
   try {
-    return JSON.parse(text);
+    return JSON.stringify(value, null, 2);
   } catch {
-    return null;
+    return String(value);
   }
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  return value as Record<string, unknown>;
-}
-
-function asString(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
-}
-
-function extractTextContent(content: string | Array<{ type: string; text?: string }>): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((c) => c.type === "text" && c.text)
-    .map((c) => c.text!)
-    .join("");
 }
 
 export function printPiStreamEvent(raw: string, _debug: boolean): void {
   const line = raw.trim();
   if (!line) return;
 
-  const parsed = asRecord(safeJsonParse(line));
-  if (!parsed) {
-    console.log(line);
-    return;
-  }
-
-  const type = asString(parsed.type);
-
-  if (type === "agent_start") {
-    console.log(pc.blue("Pi agent started"));
-    return;
-  }
-
-  if (type === "agent_end") {
-    console.log(pc.blue("Pi agent finished"));
-    return;
-  }
-
-  if (type === "turn_start") {
-    console.log(pc.blue("Turn started"));
-    return;
-  }
-
-  if (type === "turn_end") {
-    const message = asRecord(parsed.message);
-    if (message) {
-      const content = message.content as string | Array<{ type: string; text?: string }>;
-      const text = extractTextContent(content);
-      if (text) {
-        console.log(pc.green(`assistant: ${text}`));
-      }
+  for (const entry of parsePiStdoutLine(line, new Date().toISOString())) {
+    switch (entry.kind) {
+      case "init":
+        console.log(pc.blue(`Pi session started${entry.sessionId ? ` (session: ${entry.sessionId})` : ""}`));
+        break;
+      case "thinking":
+        console.log(pc.gray(`thinking: ${entry.text}`));
+        break;
+      case "assistant":
+        console.log(pc.green(`assistant: ${entry.text}`));
+        break;
+      case "tool_call":
+        console.log(pc.yellow(`tool_call: ${entry.name}`));
+        if (entry.input !== undefined) console.log(pc.gray(formatJson(entry.input)));
+        break;
+      case "tool_result":
+        console.log((entry.isError ? pc.red : pc.cyan)(`tool_result${entry.isError ? " (error)" : ""}`));
+        if (entry.content) console.log((entry.isError ? pc.red : pc.gray)(entry.content));
+        break;
+      case "result":
+        console.log(
+          pc.blue(
+            `Pi agent finished: tokens in=${entry.inputTokens} out=${entry.outputTokens} cached=${entry.cachedTokens} cost=$${entry.costUsd.toFixed(6)}`,
+          ),
+        );
+        for (const error of entry.errors) console.log(pc.red(`error: ${error}`));
+        break;
+      case "stderr":
+        console.log(pc.red(entry.text));
+        break;
+      case "system":
+        console.log(pc.blue(entry.text));
+        break;
+      default:
+        if ("text" in entry && typeof entry.text === "string") console.log(entry.text);
     }
-    return;
   }
-
-  if (type === "message_update") {
-    const assistantEvent = asRecord(parsed.assistantMessageEvent);
-    if (assistantEvent) {
-      const msgType = asString(assistantEvent.type);
-      if (msgType === "text_delta") {
-        const delta = asString(assistantEvent.delta);
-        if (delta) {
-          console.log(pc.green(delta));
-        }
-      }
-    }
-    return;
-  }
-
-  if (type === "tool_execution_start") {
-    const toolName = asString(parsed.toolName);
-    const args = parsed.args;
-    console.log(pc.yellow(`tool_start: ${toolName}`));
-    if (args !== undefined) {
-      try {
-        console.log(pc.gray(JSON.stringify(args, null, 2)));
-      } catch {
-        console.log(pc.gray(String(args)));
-      }
-    }
-    return;
-  }
-
-  if (type === "tool_execution_end") {
-    const result = parsed.result;
-    const isError = parsed.isError === true;
-    const output = typeof result === "string" ? result : JSON.stringify(result);
-    if (output) {
-      console.log((isError ? pc.red : pc.gray)(output));
-    }
-    return;
-  }
-
-  console.log(line);
 }

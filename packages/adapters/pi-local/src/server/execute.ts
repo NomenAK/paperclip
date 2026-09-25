@@ -54,6 +54,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
+import { compactPiRunLogLine } from "./log-compaction.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -722,10 +723,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Keep the last (potentially incomplete) line in the buffer
         stdoutBuffer = lines.pop() || "";
 
-        // Emit complete lines
+        // Emit complete lines, keeping only the events the transcript reads
         for (const line of lines) {
-          if (line) {
-            await onLog(stream, line + "\n");
+          const logged = line ? compactPiRunLogLine(line) : null;
+          if (logged !== null) {
+            await onLog(stream, logged + "\n");
           }
         }
       };
@@ -743,8 +745,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
 
       // Flush any remaining buffer content
-      if (stdoutBuffer) {
-        await onLog("stdout", stdoutBuffer);
+      const loggedTail = stdoutBuffer ? compactPiRunLogLine(stdoutBuffer) : null;
+      if (loggedTail !== null) {
+        await onLog("stdout", loggedTail);
       }
 
       return {
