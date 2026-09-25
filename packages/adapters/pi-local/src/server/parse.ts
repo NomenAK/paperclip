@@ -240,3 +240,59 @@ export function isPiUnknownSessionError(stdout: string, stderr: string): boolean
 
   return /unknown\s+session|session\s+not\s+found|session\s+.*\s+not\s+found|no\s+session/i.test(haystack);
 }
+
+// Provider failures are classified from Pi's error messages only (assistant
+// errorMessage, auto_retry_end finalError, error events, stderr), never from
+// tool output, which routinely contains words like "429" or "rate limit".
+const PI_PROVIDER_QUOTA_RE =
+  /(?:usage_limit_reached|usage\s+limit\s+(?:has\s+been\s+)?(?:reached|exceeded)|insufficient_quota|exceeded\s+your\s+current\s+quota|quota\s+(?:limit\s+)?exceeded|you(?:'|’)ve\s+hit\s+your\s+(?:\w+\s+)?limit|out\s+of\s+extra\s+usage|(?:5[-\s]?hour|weekly|session)\s+limit\s+reached)/i;
+const PI_TRANSIENT_UPSTREAM_RE =
+  /(?:\b(?:429|500|502|503|504|529)\b|rate[-\s_]?limit|too\s+many\s+requests|model_cooldown|cooling\s+down|overloaded|service\s+unavailable|temporarily\s+unavailable|high\s+demand|try\s+again\s+later|no\s+(?:allowed\s+)?(?:providers|endpoints)\s+(?:are\s+)?available|ECONNRESET|ETIMEDOUT|socket\s+hang\s+up|fetch\s+failed)/i;
+const PI_RETRY_AFTER_SECONDS_RE =
+  /"?(?:resets_in_seconds|reset_seconds|retry_after_seconds|retry_after)"?\s*[:=]\s*"?(\d+(?:\.\d+)?)/i;
+const PI_RESETS_AT_RE = /"?resets_at"?\s*[:=]\s*"?(\d{10,13})\b/i;
+const PI_RETRY_IN_RE = /(?:try\s+again|retry|resets?)\s+in\s+((?:\d+(?:\.\d+)?\s*(?:h|hours?|m|min(?:ute)?s?|s|sec(?:ond)?s?)\s*)+)/i;
+
+function parseDurationMs(text: string): number | null {
+  let total = 0;
+  for (const match of text.matchAll(/(\d+(?:\.\d+)?)\s*(h|m|s)/gi)) {
+    const value = Number.parseFloat(match[1] ?? "");
+    const unit = (match[2] ?? "").toLowerCase();
+    total += value * (unit === "h" ? 3_600_000 : unit === "m" ? 60_000 : 1_000);
+  }
+  return total > 0 ? total : null;
+}
+
+function extractPiRetryNotBefore(haystack: string, now: Date): Date | null {
+  const seconds = haystack.match(PI_RETRY_AFTER_SECONDS_RE);
+  if (seconds) return new Date(now.getTime() + Number.parseFloat(seconds[1] ?? "0") * 1000);
+  const resetsAt = haystack.match(PI_RESETS_AT_RE);
+  if (resetsAt) {
+    const value = Number.parseInt(resetsAt[1] ?? "", 10);
+    const date = new Date(resetsAt[1]!.length > 10 ? value : value * 1000);
+    if (date.getTime() > now.getTime()) return date;
+  }
+  const retryIn = haystack.match(PI_RETRY_IN_RE);
+  const delayMs = retryIn ? parseDurationMs(retryIn[1] ?? "") : null;
+  return delayMs ? new Date(now.getTime() + delayMs) : null;
+}
+
+export interface PiProviderFailure {
+  errorFamily: "provider_quota" | "transient_upstream";
+  retryNotBefore: Date | null;
+}
+
+export function classifyPiProviderFailure(
+  input: { errors: string[]; stderr?: string | null },
+  now = new Date(),
+): PiProviderFailure | null {
+  const haystack = [...input.errors, input.stderr ?? ""].join("\n").trim();
+  if (!haystack) return null;
+  const errorFamily = PI_PROVIDER_QUOTA_RE.test(haystack)
+    ? "provider_quota"
+    : PI_TRANSIENT_UPSTREAM_RE.test(haystack)
+      ? "transient_upstream"
+      : null;
+  if (!errorFamily) return null;
+  return { errorFamily, retryNotBefore: extractPiRetryNotBefore(haystack, now) };
+}

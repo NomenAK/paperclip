@@ -53,7 +53,7 @@ import {
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
-import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
+import { classifyPiProviderFailure, isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { compactPiRunLogLine } from "./log-compaction.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
@@ -796,16 +796,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const parsedError = attempt.parsed.errors.find((error) => error.trim().length > 0) ?? "";
       const effectiveExitCode = (rawExitCode ?? 0) === 0 && parsedError ? 1 : rawExitCode;
       const fallbackErrorMessage = parsedError || stderrLine || `Pi exited with code ${rawExitCode ?? -1}`;
+      const failed = (effectiveExitCode ?? 0) !== 0;
+      // Let the server wait for a quota reset, or retry a transient provider
+      // outage, instead of failing the agent outright.
+      const providerFailure = failed
+        ? classifyPiProviderFailure({ errors: attempt.parsed.errors, stderr: attempt.proc.stderr })
+        : null;
+      const retryNotBefore = providerFailure?.retryNotBefore?.toISOString() ?? null;
 
       return {
         exitCode: effectiveExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
-        errorMessage: (effectiveExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
-        // Forward the transport-level error code from the run-disposition seam.
-        // A lost duplex control channel surfaces the typed `duplex_channel_lost`
-        // code; every other result carries no code here.
-        errorCode: attempt.proc.errorCode ?? null,
+        errorMessage: failed ? fallbackErrorMessage : null,
+        // Forward the transport-level error code from the run-disposition seam
+        // first. A lost duplex control channel surfaces the typed
+        // `duplex_channel_lost` code before any provider classification.
+        errorCode: attempt.proc.errorCode
+          ? attempt.proc.errorCode
+          : providerFailure?.errorFamily === "provider_quota"
+            ? "provider_quota"
+            : providerFailure?.errorFamily === "transient_upstream"
+              ? "pi_transient_upstream"
+              : null,
+        errorFamily: providerFailure?.errorFamily ?? null,
+        retryNotBefore,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -822,6 +837,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
+          ...(providerFailure ? { errorFamily: providerFailure.errorFamily } : {}),
+          ...(retryNotBefore ? { retryNotBefore, transientRetryNotBefore: retryNotBefore } : {}),
+          ...(providerFailure?.errorFamily === "provider_quota" && retryNotBefore
+            ? { providerQuotaRetryNotBefore: retryNotBefore }
+            : {}),
         },
         summary: attempt.parsed.finalMessage ?? attempt.parsed.messages.join("\n\n").trim(),
         clearSession: Boolean(clearSessionOnMissingSession),
