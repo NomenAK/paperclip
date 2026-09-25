@@ -166,6 +166,15 @@ export async function discoverPiModelsCached(input: {
   return models;
 }
 
+async function discoverPiModelsFresh(input: { command?: unknown; cwd?: unknown; env?: unknown }): Promise<AdapterModel[]> {
+  const command = resolvePiCommand(input.command);
+  const cwd = asString(input.cwd, process.cwd());
+  const env = normalizeEnv(input.env);
+  const models = await discoverPiModels({ command, cwd, env });
+  discoveryCache.set(discoveryCacheKey(command, cwd, env), { expiresAt: Date.now() + MODELS_CACHE_TTL_MS, models });
+  return models;
+}
+
 export async function ensurePiModelConfiguredAndAvailable(input: {
   model?: unknown;
   command?: unknown;
@@ -177,11 +186,20 @@ export async function ensurePiModelConfiguredAndAvailable(input: {
     throw new Error("Pi requires `adapterConfig.model` in provider/model format.");
   }
 
-  const models = await discoverPiModelsCached({
+  let models = await discoverPiModelsCached({
     command: input.command,
     cwd: input.cwd,
     env: input.env,
   });
+  // A cached or momentarily incomplete listing (e.g. a provider catalog that
+  // failed to load) must not fail the run: rediscover once before giving up.
+  if (!models.some((entry) => entry.id === model)) {
+    models = await discoverPiModelsFresh({
+      command: input.command,
+      cwd: input.cwd,
+      env: input.env,
+    });
+  }
 
   if (models.length === 0) {
     throw new Error("Pi returned no models. Run `pi --list-models` and verify provider auth.");

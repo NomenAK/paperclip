@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parsePiJsonl, isPiUnknownSessionError } from "./parse.js";
+import { classifyPiProviderFailure, parsePiJsonl, isPiUnknownSessionError } from "./parse.js";
 
 describe("parsePiJsonl", () => {
   it("parses agent lifecycle and messages", () => {
@@ -286,5 +286,52 @@ describe("terminal provider failures", () => {
   it("reports an error even when the provider omitted its message", () => {
     expect(parsePiJsonl(JSON.stringify({ type: "turn_end", message: { role: "assistant", stopReason: "error" } })).errors)
       .toEqual(["Pi provider request failed."]);
+  });
+});
+
+describe("classifyPiProviderFailure", () => {
+  const now = new Date("2026-09-26T00:00:00.000Z");
+
+  it("waits for the reset of an exhausted quota behind a proxy cooldown", () => {
+    const error =
+      '429: {"code":"model_cooldown","last_upstream_error":"usage_limit_reached: The usage limit has been reached","message":"All credentials for model gpt-6-sol are cooling down via provider codex (last error: usage_limit_reached: The usage limit has been reached)","model":"gpt-6-sol","provider":"codex","reset_seconds":13104,"reset_time":"3h38m24s"}';
+    expect(classifyPiProviderFailure({ errors: [error] }, now)).toEqual({
+      errorFamily: "provider_quota",
+      retryNotBefore: new Date(now.getTime() + 13_104_000),
+    });
+  });
+
+  it("reads resets_in_seconds from a Codex usage limit", () => {
+    const error =
+      '429: {"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1790393000,"eligible_promo":null,"resets_in_seconds":7200}';
+    expect(classifyPiProviderFailure({ errors: [error] }, now)).toEqual({
+      errorFamily: "provider_quota",
+      retryNotBefore: new Date(now.getTime() + 7_200_000),
+    });
+  });
+
+  it("treats rate limits and outages without a quota as transient", () => {
+    for (const error of [
+      '429 {"error":{"message":"Rate limit exceeded: free-models-per-min"}}',
+      "503 No endpoints available for this model",
+      "Provider overloaded, try again later",
+      "fetch failed: ECONNRESET",
+    ]) {
+      expect(classifyPiProviderFailure({ errors: [error] }, now)).toEqual({
+        errorFamily: "transient_upstream",
+        retryNotBefore: null,
+      });
+    }
+    expect(
+      classifyPiProviderFailure({ errors: ['429: {"code":"model_cooldown","reset_seconds":20}'] }, now),
+    ).toEqual({ errorFamily: "transient_upstream", retryNotBefore: new Date(now.getTime() + 20_000) });
+    expect(
+      classifyPiProviderFailure({ errors: ["You've hit your limit. Try again in 1h 30m."] }, now),
+    ).toEqual({ errorFamily: "provider_quota", retryNotBefore: new Date(now.getTime() + 5_400_000) });
+  });
+
+  it("leaves other failures unclassified", () => {
+    expect(classifyPiProviderFailure({ errors: ["Pi exited with code 1"], stderr: "" }, now)).toBeNull();
+    expect(classifyPiProviderFailure({ errors: [], stderr: "" }, now)).toBeNull();
   });
 });
