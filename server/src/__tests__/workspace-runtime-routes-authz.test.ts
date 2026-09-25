@@ -452,6 +452,33 @@ describe.sequential("workspace runtime service route authorization", () => {
 
   }, 15000);
 
+  it("rejects agent PATCH that implicitly removes an existing project provision command", async () => {
+    mockProjectService.getById.mockResolvedValue(buildProject({
+      executionWorkspacePolicy: {
+        enabled: true,
+        workspaceStrategy: { type: "git_worktree", provisionCommand: "echo host-only" },
+      },
+    }));
+    const app = await createProjectApp({
+      type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key", runId: "run-1",
+    });
+
+    const res = await request(app).patch(`/api/projects/${projectId}`).send({
+      executionWorkspacePolicy: {
+        enabled: true,
+        workspaceStrategy: { type: "git_worktree", branchTemplate: "safe/{issueIdentifier}" },
+      },
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("executionWorkspacePolicy.workspaceStrategy.provisionCommand");
+    expect(mockProjectService.update).not.toHaveBeenCalled();
+
+    const unrelated = await request(app).patch(`/api/projects/${projectId}`).send({ name: "Renamed" });
+    expect(unrelated.status).toBe(200);
+    expect(mockProjectService.update).toHaveBeenCalledWith(projectId, { name: "Renamed" });
+  });
+
   it("rejects agent callers that create project execution workspace commands", async () => {
     const app = await createProjectApp({
       type: "agent",
