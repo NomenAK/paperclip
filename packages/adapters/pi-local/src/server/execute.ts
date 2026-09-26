@@ -877,6 +877,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // the server retry when the first one recovers.
     const toChainCoolingDownResult = (
       recovery: { model: string; cooldown: PiModelCooldown },
+      unlistedModels: string[] = [],
     ): AdapterExecutionResult => {
       const errorFamily = recovery.cooldown.kind === "hard" ? "provider_quota" : "transient_upstream";
       const retryNotBefore = recovery.cooldown.until;
@@ -885,7 +886,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: null,
         timedOut: false,
         errorMessage:
-          `All Pi models are cooling down (${modelChain.join(", ")}); ` +
+          (unlistedModels.length > 0
+            ? `The Pi model catalogue misses ${unlistedModels.join(", ")} and the other models are cooling down; `
+            : `All Pi models are cooling down (${modelChain.join(", ")}); `) +
           `${recovery.model} is next available at ${retryNotBefore}.`,
         errorCode: errorFamily === "provider_quota" ? "provider_quota" : "pi_transient_upstream",
         errorFamily,
@@ -962,6 +965,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       };
 
+      const unlistedModels: string[] = [];
       for (const [index, candidate] of candidates.entries()) {
         const nextCandidate = candidates[index + 1] ?? null;
         if (!executionTargetIsRemote) {
@@ -972,14 +976,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             // chain, for this run only: a listing failure or this agent's own
             // env says nothing about the provider, so nothing is shared.
             const reason = err instanceof Error ? err.message : String(err);
-            if (!reason.startsWith(PI_MODEL_UNAVAILABLE_PREFIX) || (!nextCandidate && !lastResult)) throw err;
+            if (!reason.startsWith(PI_MODEL_UNAVAILABLE_PREFIX) || modelChain.length <= 1) throw err;
+            unlistedModels.push(candidate);
             await onLog(
               "stdout",
-              `[paperclip] Pi model ${candidate} is not listed by Pi` +
-                (nextCandidate ? `; falling back to ${nextCandidate}.\n` : ".\n"),
+              `[paperclip] ${candidate === model ? "Primary" : "Fallback"} Pi model ${candidate} is absent from ` +
+                "the Pi model catalogue (pi --list-models)" +
+                (nextCandidate ? `; falling back to ${nextCandidate} for this run.\n` : ".\n"),
             );
             if (nextCandidate) continue;
-            break;
+            if (lastResult) break;
+            // Nothing ran: the catalogue misses the remaining models. Wait for
+            // a model that is only cooling down instead of failing the run.
+            const coolingDown = plan.skipped.filter((entry) => !unlistedModels.includes(entry.model));
+            if (coolingDown.length > 0) {
+              const recovery = coolingDown.reduce((earliest, entry) =>
+                Date.parse(entry.cooldown.until) < Date.parse(earliest.cooldown.until) ? entry : earliest,
+              );
+              return toChainCoolingDownResult(recovery, unlistedModels);
+            }
+            const availableModelsIndex = reason.indexOf(" Available models:");
+            throw new Error(
+              `${PI_MODEL_UNAVAILABLE_PREFIX} ${model}. Fallback models are unavailable too: ` +
+                `${unlistedModels.filter((entry) => entry !== model).join(", ")}.` +
+                (availableModelsIndex >= 0 ? reason.slice(availableModelsIndex) : ""),
+            );
           }
         }
 

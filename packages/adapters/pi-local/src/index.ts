@@ -38,7 +38,7 @@ Notes:
 - Pi supports multiple providers and models. Use \`pi --list-models\` to list available options.
 - Paperclip requires an explicit \`model\` value for \`pi_local\` agents.
 - Sessions are stored in ~/.pi/paperclips/ and resumed with --session.
-- Model fallback: a quota failure skips a model until its announced reset (1 h when unknown); a transient failure (rate limit, overload, outage) skips it for 1 min, doubling up to 30 min. A model missing from \`pi --list-models\` is skipped for that run only. Other failures never fall back. Cooldowns live in ~/.pi/paperclips/model-cooldowns.json and are shared by all pi_local agents; each run starts from the first model not cooling down, so it returns to \`model\` once that recovers.
+- Model fallback: a quota failure skips a model until its announced reset (1 h when unknown); a transient failure (rate limit, overload, outage) skips it for 1 min, doubling up to 30 min. A model missing from \`pi --list-models\` (the primary included) is skipped for that run only; if the rest of the chain is cooling down, the run waits for the first model to recover. Other failures never fall back. Cooldowns live in ~/.pi/paperclips/model-cooldowns.json and are shared by all pi_local agents; each run starts from the first model not cooling down, so it returns to \`model\` once that recovers.
 - All tools (read, bash, edit, write, grep, find, ls) are enabled by default.
 - Agent instructions are appended to Pi's system prompt via --append-system-prompt, while the user task is sent via -p.
 `;

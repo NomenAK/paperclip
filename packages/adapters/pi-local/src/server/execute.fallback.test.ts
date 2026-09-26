@@ -5,7 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { resetPiModelsCacheForTests } from "./models.js";
 
-// Fake `pi`: lists four models (not "mock/gone") and answers per --model.
+// Fake `pi`: lists five models (not "mock/gone" or "mock/missing") and answers per --model.
 // Each invocation is appended to calls.log as one JSON line.
 const FAKE_PI = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
@@ -148,11 +148,48 @@ describe("pi model fallback chain", () => {
   });
 
   it("falls back from a model Pi does not list, for this run only", async () => {
-    const { result, calls, cooldowns } = await run({ model: "mock/gone", fallbackModels: ["mock/good"] });
+    const { result, calls, cooldowns, log } = await run({ model: "mock/gone", fallbackModels: ["mock/good"] });
     expect(calls.map((call) => call.model)).toEqual(["good"]);
     expect(calls[0]!.prompt).not.toContain("The previous model");
     expect(result.model).toBe("mock/good");
     expect(cooldowns).toEqual({});
+    expect(log).toContain(
+      "Primary Pi model mock/gone is absent from the Pi model catalogue (pi --list-models); falling back to mock/good for this run.",
+    );
+  });
+
+  it("starts on the first listed fallback when the primary and earlier fallbacks are not listed", async () => {
+    const { result, calls, cooldowns, log } = await run({
+      model: "mock/gone",
+      fallbackModels: ["mock/missing", "mock/good"],
+    });
+    expect(calls.map((call) => call.model)).toEqual(["good"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.model).toBe("mock/good");
+    expect(cooldowns).toEqual({});
+    expect(log).toContain("Fallback Pi model mock/missing is absent from the Pi model catalogue (pi --list-models); falling back to mock/good");
+  });
+
+  it("fails with the unavailable-model error when no model of the chain is listed", async () => {
+    await expect(run({ model: "mock/gone", fallbackModels: ["mock/missing"] })).rejects.toThrow(
+      /^Configured Pi model is unavailable: mock\/gone\. Fallback models are unavailable too: mock\/missing\. Available models: mock\//,
+    );
+    expect(JSON.parse(await fs.readFile(cooldownsFile, "utf8").catch(() => "{}"))).toEqual({});
+  });
+
+  it("waits for a cooling-down model when the rest of the chain is not listed", async () => {
+    // First run: flaky fails and cools down; gone is not listed, so the run
+    // reports flaky's failure.
+    const first = await run({ model: "mock/flaky", fallbackModels: ["mock/gone"] });
+    expect(first.result.errorFamily).toBe("transient_upstream");
+    expect(first.log).toContain("Fallback Pi model mock/gone is absent from the Pi model catalogue (pi --list-models).");
+    const { result, calls, cooldowns } = await run({ model: "mock/flaky", fallbackModels: ["mock/gone"] });
+    expect(calls.map((call) => call.model)).toEqual(["flaky"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.retryNotBefore).toBe(cooldowns["mock/flaky"].until);
+    expect(result.errorMessage).toContain("The Pi model catalogue misses mock/gone and the other models are cooling down; mock/flaky is next available at");
+    expect(result.resultJson).toMatchObject({ executionRecovery: { kind: "bootstrap", providerWorkStarted: false } });
   });
 
   it("surfaces a model listing failure instead of cooling models down", async () => {
@@ -172,6 +209,11 @@ describe("pi model fallback chain", () => {
     expect(calls.map((call) => call.model)).toEqual(["flaky"]);
     expect(result.errorFamily).toBe("transient_upstream");
     expect(result.resultJson).toMatchObject({ executionRecovery: { kind: "bootstrap", providerWorkStarted: false } });
-    await expect(run({ model: "mock/gone" })).rejects.toThrow("Configured Pi model is unavailable: mock/gone");
+  });
+
+  it("keeps failing a lone model Pi does not list", async () => {
+    await expect(run({ model: "mock/gone" })).rejects.toThrow(
+      /^Configured Pi model is unavailable: mock\/gone\. Available models: mock\//,
+    );
   });
 });
