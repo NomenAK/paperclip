@@ -419,7 +419,7 @@ describeEmbeddedPostgres("built-in agents", () => {
       details: {
         code: "built_in_agent_adapter_not_allowed",
         key: "briefs",
-        allowedAdapterTypes: ["codex_local", "claude_local", "gemini_local", "opencode_local", "process"],
+        allowedAdapterTypes: ["codex_local", "claude_local", "gemini_local", "opencode_local", "process", "pi_local"],
       },
     });
   });
