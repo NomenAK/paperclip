@@ -873,8 +873,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     };
 
-    // Every model of the chain is cooling down: fail before spawning Pi and let
-    // the server retry when the first one recovers.
+    // Every model of the chain is cooling down or missing from the catalogue:
+    // fail before spawning Pi and let the server retry when the first one recovers.
     const toChainCoolingDownResult = (
       recovery: { model: string; cooldown: PiModelCooldown },
       unlistedModels: string[] = [],
@@ -887,7 +887,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: false,
         errorMessage:
           (unlistedModels.length > 0
-            ? `The Pi model catalogue misses ${unlistedModels.join(", ")} and the other models are cooling down; `
+            ? `The Pi model catalogue temporarily misses ${unlistedModels.join(", ")}` +
+              (unlistedModels.length < modelChain.length ? " and the other models are cooling down; " : "; ")
             : `All Pi models are cooling down (${modelChain.join(", ")}); `) +
           `${recovery.model} is next available at ${retryNotBefore}.`,
         errorCode: errorFamily === "provider_quota" ? "provider_quota" : "pi_transient_upstream",
@@ -966,41 +967,42 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
 
       const unlistedModels: string[] = [];
+      const unavailable = [...plan.skipped];
       for (const [index, candidate] of candidates.entries()) {
         const nextCandidate = candidates[index + 1] ?? null;
         if (!executionTargetIsRemote) {
           try {
             await ensurePiModelConfiguredAndAvailable({ model: candidate, command, cwd, env: runtimeEnv });
           } catch (err) {
-            // Only a model missing from a successful listing moves down the
-            // chain, for this run only: a listing failure or this agent's own
-            // env says nothing about the provider, so nothing is shared.
+            // A model missing from a successful listing is a transient provider
+            // catalogue glitch (the gateway hides it for a short while): cool it
+            // down like a transient provider failure, so other runs skip it too.
+            // A listing failure says nothing about the model and is surfaced.
             const reason = err instanceof Error ? err.message : String(err);
-            if (!reason.startsWith(PI_MODEL_UNAVAILABLE_PREFIX) || modelChain.length <= 1) throw err;
+            if (!reason.startsWith(PI_MODEL_UNAVAILABLE_PREFIX)) throw err;
+            const { cooldown } = await cooldownStore.recordFailure({
+              model: candidate,
+              kind: "soft",
+              retryNotBefore: null,
+              reason: "Temporarily missing from the Pi model catalogue (pi --list-models)",
+            });
             unlistedModels.push(candidate);
+            unavailable.push({ model: candidate, cooldown });
             await onLog(
               "stdout",
-              `[paperclip] ${candidate === model ? "Primary" : "Fallback"} Pi model ${candidate} is absent from ` +
-                "the Pi model catalogue (pi --list-models)" +
-                (nextCandidate ? `; falling back to ${nextCandidate} for this run.\n` : ".\n"),
+              `[paperclip] ${candidate === model ? "Primary" : "Fallback"} Pi model ${candidate} is missing from ` +
+                "the Pi model catalogue (pi --list-models); treating it as temporarily unavailable " +
+                `(${formatCooldownUntil(cooldown)})` +
+                (nextCandidate ? `; falling back to ${nextCandidate}.\n` : ".\n"),
             );
             if (nextCandidate) continue;
             if (lastResult) break;
-            // Nothing ran: the catalogue misses the remaining models. Wait for
-            // a model that is only cooling down instead of failing the run.
-            const coolingDown = plan.skipped.filter((entry) => !unlistedModels.includes(entry.model));
-            if (coolingDown.length > 0) {
-              const recovery = coolingDown.reduce((earliest, entry) =>
-                Date.parse(entry.cooldown.until) < Date.parse(earliest.cooldown.until) ? entry : earliest,
-              );
-              return toChainCoolingDownResult(recovery, unlistedModels);
-            }
-            const availableModelsIndex = reason.indexOf(" Available models:");
-            throw new Error(
-              `${PI_MODEL_UNAVAILABLE_PREFIX} ${model}. Fallback models are unavailable too: ` +
-                `${unlistedModels.filter((entry) => entry !== model).join(", ")}.` +
-                (availableModelsIndex >= 0 ? reason.slice(availableModelsIndex) : ""),
+            // Nothing ran: every model is missing or cooling down. Let the
+            // server retry when the first one recovers instead of failing.
+            const recovery = unavailable.reduce((earliest, entry) =>
+              Date.parse(entry.cooldown.until) < Date.parse(earliest.cooldown.until) ? entry : earliest,
             );
+            return toChainCoolingDownResult(recovery, unlistedModels);
           }
         }
 

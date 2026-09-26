@@ -147,18 +147,24 @@ describe("pi model fallback chain", () => {
     expect(result.errorFamily).toBeNull();
   });
 
-  it("falls back from a model Pi does not list, for this run only", async () => {
+  it("falls back from a model missing from the catalogue and cools it down like a transient failure", async () => {
+    const before = Date.now();
     const { result, calls, cooldowns, log } = await run({ model: "mock/gone", fallbackModels: ["mock/good"] });
     expect(calls.map((call) => call.model)).toEqual(["good"]);
     expect(calls[0]!.prompt).not.toContain("The previous model");
     expect(result.model).toBe("mock/good");
-    expect(cooldowns).toEqual({});
+    expect(cooldowns["mock/gone"]).toMatchObject({ kind: "soft", softFailures: 1 });
+    expect(Date.parse(cooldowns["mock/gone"].until) - before).toBeGreaterThanOrEqual(60_000);
+    expect(Date.parse(cooldowns["mock/gone"].until) - before).toBeLessThan(2 * 60_000);
+    expect(cooldowns["mock/good"]).toBeUndefined();
     expect(log).toContain(
-      "Primary Pi model mock/gone is absent from the Pi model catalogue (pi --list-models); falling back to mock/good for this run.",
+      "Primary Pi model mock/gone is missing from the Pi model catalogue (pi --list-models); " +
+        "treating it as temporarily unavailable (transient cooldown until ",
     );
+    expect(log).toContain("); falling back to mock/good.");
   });
 
-  it("starts on the first listed fallback when the primary and earlier fallbacks are not listed", async () => {
+  it("starts on the first listed fallback when the primary and earlier fallbacks are missing", async () => {
     const { result, calls, cooldowns, log } = await run({
       model: "mock/gone",
       fallbackModels: ["mock/missing", "mock/good"],
@@ -166,30 +172,66 @@ describe("pi model fallback chain", () => {
     expect(calls.map((call) => call.model)).toEqual(["good"]);
     expect(result.exitCode).toBe(0);
     expect(result.model).toBe("mock/good");
-    expect(cooldowns).toEqual({});
-    expect(log).toContain("Fallback Pi model mock/missing is absent from the Pi model catalogue (pi --list-models); falling back to mock/good");
+    expect(cooldowns["mock/gone"]).toMatchObject({ kind: "soft" });
+    expect(cooldowns["mock/missing"]).toMatchObject({ kind: "soft" });
+    expect(log).toContain("Fallback Pi model mock/missing is missing from the Pi model catalogue (pi --list-models)");
   });
 
-  it("fails with the unavailable-model error when no model of the chain is listed", async () => {
-    await expect(run({ model: "mock/gone", fallbackModels: ["mock/missing"] })).rejects.toThrow(
-      /^Configured Pi model is unavailable: mock\/gone\. Fallback models are unavailable too: mock\/missing\. Available models: mock\//,
+  it("skips a model that an earlier run found missing from the catalogue", async () => {
+    await run({ model: "mock/gone", fallbackModels: ["mock/good"] });
+    const { result, calls, cooldowns, log } = await run({ model: "mock/gone", fallbackModels: ["mock/good"] });
+    expect(calls.map((call) => call.model)).toEqual(["good", "good"]);
+    expect(result.model).toBe("mock/good");
+    expect(log).toContain("Skipping Pi model mock/gone: transient cooldown until");
+    expect(log).not.toContain("Primary Pi model mock/gone is missing");
+    expect(cooldowns["mock/gone"]).toMatchObject({ kind: "soft", softFailures: 1 });
+  });
+
+  it("returns the chain cooldown result when no model of the chain is in the catalogue", async () => {
+    const { result, calls, cooldowns } = await run({ model: "mock/gone", fallbackModels: ["mock/missing"] });
+    expect(calls).toEqual([]);
+    expect(cooldowns["mock/gone"]).toMatchObject({ kind: "soft", softFailures: 1 });
+    expect(cooldowns["mock/missing"]).toMatchObject({ kind: "soft", softFailures: 1 });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.errorCode).toBe("pi_transient_upstream");
+    expect(result.model).toBe("mock/gone");
+    expect(result.retryNotBefore).toBe(cooldowns["mock/gone"].until);
+    expect(result.errorMessage).toBe(
+      `The Pi model catalogue temporarily misses mock/gone, mock/missing; mock/gone is next available at ${cooldowns["mock/gone"].until}.`,
     );
-    expect(JSON.parse(await fs.readFile(cooldownsFile, "utf8").catch(() => "{}"))).toEqual({});
+    expect(result.resultJson).toMatchObject({
+      errorFamily: "transient_upstream",
+      transientRetryNotBefore: cooldowns["mock/gone"].until,
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+    });
+    expect(result.resultJson).not.toHaveProperty("providerQuotaRetryNotBefore");
   });
 
-  it("waits for a cooling-down model when the rest of the chain is not listed", async () => {
-    // First run: flaky fails and cools down; gone is not listed, so the run
-    // reports flaky's failure.
-    const first = await run({ model: "mock/flaky", fallbackModels: ["mock/gone"] });
-    expect(first.result.errorFamily).toBe("transient_upstream");
-    expect(first.log).toContain("Fallback Pi model mock/gone is absent from the Pi model catalogue (pi --list-models).");
+  it("waits for a cooling-down model when the rest of the chain is missing from the catalogue", async () => {
+    await run({ model: "mock/flaky" });
     const { result, calls, cooldowns } = await run({ model: "mock/flaky", fallbackModels: ["mock/gone"] });
     expect(calls.map((call) => call.model)).toEqual(["flaky"]);
+    expect(cooldowns["mock/gone"]).toMatchObject({ kind: "soft" });
     expect(result.exitCode).toBe(1);
     expect(result.errorFamily).toBe("transient_upstream");
     expect(result.retryNotBefore).toBe(cooldowns["mock/flaky"].until);
-    expect(result.errorMessage).toContain("The Pi model catalogue misses mock/gone and the other models are cooling down; mock/flaky is next available at");
+    expect(result.errorMessage).toContain(
+      "The Pi model catalogue temporarily misses mock/gone and the other models are cooling down; mock/flaky is next available at",
+    );
     expect(result.resultJson).toMatchObject({ executionRecovery: { kind: "bootstrap", providerWorkStarted: false } });
+  });
+
+  it("reports the provider failure when the fallbacks after it are missing from the catalogue", async () => {
+    const { result, cooldowns, log } = await run({ model: "mock/flaky", fallbackModels: ["mock/gone"] });
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.model).toBe("mock/flaky");
+    expect(result.retryNotBefore).toBe(cooldowns["mock/flaky"].until);
+    expect(cooldowns["mock/gone"]).toMatchObject({ kind: "soft" });
+    expect(log).toContain(
+      "Fallback Pi model mock/gone is missing from the Pi model catalogue (pi --list-models); " +
+        "treating it as temporarily unavailable (transient cooldown until ",
+    );
   });
 
   it("surfaces a model listing failure instead of cooling models down", async () => {
@@ -211,9 +253,35 @@ describe("pi model fallback chain", () => {
     expect(result.resultJson).toMatchObject({ executionRecovery: { kind: "bootstrap", providerWorkStarted: false } });
   });
 
-  it("keeps failing a lone model Pi does not list", async () => {
-    await expect(run({ model: "mock/gone" })).rejects.toThrow(
-      /^Configured Pi model is unavailable: mock\/gone\. Available models: mock\//,
+  it("returns the chain cooldown result for a lone model missing from the catalogue", async () => {
+    const first = await run({ model: "mock/gone" });
+    expect(first.calls).toEqual([]);
+    expect(first.cooldowns["mock/gone"]).toMatchObject({ kind: "soft", softFailures: 1 });
+    expect(first.result.exitCode).toBe(1);
+    expect(first.result.errorFamily).toBe("transient_upstream");
+    expect(first.result.retryNotBefore).toBe(first.cooldowns["mock/gone"].until);
+    expect(first.result.errorMessage).toContain("The Pi model catalogue temporarily misses mock/gone; mock/gone is next available at");
+    expect(first.log).toContain(
+      "Primary Pi model mock/gone is missing from the Pi model catalogue (pi --list-models); " +
+        "treating it as temporarily unavailable (transient cooldown until ",
     );
+    // A lone model is checked again, but a run within the same cooldown is the
+    // same glitch: it does not back off further.
+    const second = await run({ model: "mock/gone" });
+    expect(second.result.retryNotBefore).toBe(first.result.retryNotBefore);
+    expect(second.cooldowns["mock/gone"]).toMatchObject({ kind: "soft", softFailures: 1 });
+  });
+
+  it("runs a lone model again once it is back in the catalogue", async () => {
+    await fs.writeFile(
+      cooldownsFile,
+      JSON.stringify({
+        "mock/good": { kind: "soft", until: new Date(Date.now() - 1_000).toISOString(), softFailures: 1, reason: "missing" },
+      }),
+    );
+    const { result, calls, cooldowns } = await run({ model: "mock/good" });
+    expect(calls.map((call) => call.model)).toEqual(["good"]);
+    expect(result.exitCode).toBe(0);
+    expect(cooldowns["mock/good"]).toBeUndefined();
   });
 });
