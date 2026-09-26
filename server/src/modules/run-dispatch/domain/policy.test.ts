@@ -453,6 +453,16 @@ describe("decideQueuedRunStaleness", () => {
     };
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
   });
+
+  it("keeps the verified addressee of a pending interaction on a non-assigned issue", () => {
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      issueAssigneeAgentId: "agent-2",
+      wakeReason: "interaction_pending",
+    };
+    expect(decideQueuedRunStaleness(facts, NOW)).toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    expect(decideQueuedRunStaleness({ ...facts, isPendingInteractionAddressee: true }, NOW)).toEqual({ stale: false });
+  });
 });
 
 describe("native replacement execution authority", () => {

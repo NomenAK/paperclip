@@ -146,6 +146,8 @@ export type QueuedRunFacts = {
   /** A connection resolution or tool refresh can resume an agent waiting in review. */
   isConnectionContinuation?: boolean;
   isInteractionWake: boolean;
+  /** An `interaction_pending` wake for the verified addressee of a still-pending interaction on the issue. */
+  isPendingInteractionAddressee?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -168,6 +170,7 @@ type OwnershipFacts = {
   issueAssigneeAgentId: string | null;
   isNonAssigneeWorkspaceBusyRetry: boolean;
   isInteractionWake?: boolean;
+  isPendingInteractionAddressee?: boolean;
   isCurrentReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery?: boolean;
 };
@@ -183,6 +186,7 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.issueAssigneeAgentId === facts.runAgentId) return "current_owner";
   if (facts.isNonAssigneeWorkspaceBusyRetry) return "current_owner";
   if (facts.isInteractionWake) return "current_owner";
+  if (facts.isPendingInteractionAddressee) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
   return "reassigned";
@@ -564,6 +568,7 @@ export function decideQueuedRunStaleness(
     issueAssigneeAgentId: facts.issueAssigneeAgentId,
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
     isInteractionWake: facts.isInteractionWake,
+    isPendingInteractionAddressee: facts.isPendingInteractionAddressee,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&
