@@ -1,0 +1,177 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { resetPiModelsCacheForTests } from "./models.js";
+
+// Fake `pi`: lists four models (not "mock/gone") and answers per --model.
+// Each invocation is appended to calls.log as one JSON line.
+const FAKE_PI = String.raw`#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+if (args.includes("--list-models")) {
+  if (fs.existsSync(path.join(__dirname, "list-fails"))) process.exit(1);
+  process.stderr.write("provider  model  context\nmock  quota  1M\nmock  flaky  1M\nmock  good  1M\nmock  badauth  1M\nmock  bigtool  1M\n");
+  process.exit(0);
+}
+const arg = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : ""; };
+const model = arg("--model");
+fs.appendFileSync(path.join(__dirname, "calls.log"), JSON.stringify({ model, session: arg("--session"), prompt: args[args.length - 1] }) + "\n");
+const out = (event) => process.stdout.write(JSON.stringify(event) + "\n");
+const fail = (errorMessage) => out({ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage, content: [] } });
+if (model === "quota") {
+  out({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "ls" } });
+  out({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash", result: "ok" });
+  fail('429: {"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":7200}');
+} else if (model === "flaky") fail("503 Service Unavailable: model overloaded");
+else if (model === "badauth") fail("401 invalid api key");
+else if (model === "bigtool") {
+  // A tool runs, then over 4 MB of streaming updates push it out of the
+  // captured stdout tail before the provider fails.
+  out({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "git push" } });
+  const filler = "x".repeat(64 * 1024);
+  for (let i = 0; i < 80; i += 1) out({ type: "message_update", delta: filler });
+  fail("503 Service Unavailable: model overloaded");
+}
+else out({ type: "turn_end", message: { role: "assistant", content: "done by " + model, usage: { input: 1, output: 1, cacheRead: 0, cost: { total: 0 } } }, toolResults: [] });
+`;
+
+let root: string;
+let fakePi: string;
+let cooldownsFile: string;
+let execute: (ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>;
+const previousHome = process.env.HOME;
+
+beforeAll(async () => {
+  root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-fallback-exec-"));
+  // Sessions and skills live under ~/.pi: keep them out of the real home.
+  process.env.HOME = root;
+  cooldownsFile = path.join(root, "cooldowns.json");
+  process.env.PAPERCLIP_PI_MODEL_COOLDOWNS_FILE = cooldownsFile;
+  fakePi = path.join(root, "bin", "pi");
+  await fs.mkdir(path.dirname(fakePi), { recursive: true });
+  await fs.writeFile(fakePi, FAKE_PI, { mode: 0o755 });
+  process.env.PAPERCLIP_PI_COMMAND = fakePi;
+  ({ execute } = await import("./execute.js"));
+});
+
+afterAll(async () => {
+  process.env.HOME = previousHome;
+  delete process.env.PAPERCLIP_PI_MODEL_COOLDOWNS_FILE;
+  delete process.env.PAPERCLIP_PI_COMMAND;
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+beforeEach(async () => {
+  resetPiModelsCacheForTests();
+  await fs.rm(path.join(root, "bin", "list-fails"), { force: true });
+  await fs.rm(cooldownsFile, { force: true });
+  await fs.rm(path.join(root, "bin", "calls.log"), { force: true });
+});
+
+async function run(config: Record<string, unknown>) {
+  const logs: string[] = [];
+  const workspace = path.join(root, "workspace");
+  await fs.mkdir(workspace, { recursive: true });
+  const result = await execute({
+    runId: "run-1",
+    agent: { id: "agent-1", companyId: "company-1", name: "Pi", adapterType: "pi_local", adapterConfig: {} },
+    runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+    config: { command: fakePi, ...config },
+    context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
+    onLog: async (_stream: string, chunk: string) => {
+      logs.push(chunk);
+    },
+  } as unknown as AdapterExecutionContext);
+  const calls = (await fs.readFile(path.join(root, "bin", "calls.log"), "utf8").catch(() => ""))
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { model: string; session: string; prompt: string });
+  const cooldowns = JSON.parse(await fs.readFile(cooldownsFile, "utf8").catch(() => "{}"));
+  return { result, calls, cooldowns, log: logs.join("") };
+}
+
+describe("pi model fallback chain", () => {
+  it("falls back down the chain in the same session and reports the model that ran", async () => {
+    const { result, calls, cooldowns, log } = await run({
+      model: "mock/quota",
+      fallbackModels: ["mock/flaky", "mock/good"],
+    });
+    expect(calls.map((call) => call.model)).toEqual(["quota", "flaky", "good"]);
+    expect(new Set(calls.map((call) => call.session)).size).toBe(1);
+    expect(calls[1]!.prompt).toContain("The previous model (mock/quota) stopped");
+    expect(calls[2]!.prompt).toContain("The previous model (mock/flaky) stopped");
+    expect(result.exitCode).toBe(0);
+    expect(result.model).toBe("mock/good");
+    expect(result.provider).toBe("mock");
+    expect(cooldowns["mock/quota"]).toMatchObject({ kind: "hard" });
+    expect(cooldowns["mock/flaky"]).toMatchObject({ kind: "soft", softFailures: 1 });
+    expect(cooldowns["mock/good"]).toBeUndefined();
+    expect(log).toContain("Run completed on fallback Pi model mock/good");
+    expect((result.resultJson as { modelAttempts: Array<{ model: string }> }).modelAttempts.map((entry) => entry.model))
+      .toEqual(["mock/quota", "mock/flaky", "mock/good"]);
+  });
+
+  it("skips cooling-down models on the next run", async () => {
+    await run({ model: "mock/quota", fallbackModels: ["mock/good"] });
+    const { calls, log } = await run({ model: "mock/quota", fallbackModels: ["mock/good"] });
+    expect(calls.map((call) => call.model)).toEqual(["quota", "good", "good"]);
+    expect(log).toContain("Skipping Pi model mock/quota: quota cooldown until");
+  });
+
+  it("fails fast with the earliest recovery when the whole chain is cooling down", async () => {
+    await run({ model: "mock/quota", fallbackModels: ["mock/flaky"] });
+    const { result, calls } = await run({ model: "mock/quota", fallbackModels: ["mock/flaky"] });
+    expect(calls.map((call) => call.model)).toEqual(["quota", "flaky"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.model).toBe("mock/flaky");
+    expect(result.resultJson).toMatchObject({ executionRecovery: { kind: "bootstrap", providerWorkStarted: false } });
+  });
+
+  it("returns the soonest chain recovery when the last model fails", async () => {
+    const { result } = await run({ model: "mock/flaky", fallbackModels: ["mock/quota"] });
+    expect(result.errorFamily).toBe("provider_quota");
+    // flaky cools down for one minute, quota for two hours: retry after the minute.
+    expect(Date.parse(result.retryNotBefore!) - Date.now()).toBeLessThan(2 * 60_000);
+    // The quota attempt ran a tool, so the run is not replayable blindly.
+    expect(result.resultJson).not.toHaveProperty("executionRecovery");
+  });
+
+  it("does not fall back on non-provider failures", async () => {
+    const { result, calls } = await run({ model: "mock/badauth", fallbackModels: ["mock/good"] });
+    expect(calls.map((call) => call.model)).toEqual(["badauth"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorFamily).toBeNull();
+  });
+
+  it("falls back from a model Pi does not list, for this run only", async () => {
+    const { result, calls, cooldowns } = await run({ model: "mock/gone", fallbackModels: ["mock/good"] });
+    expect(calls.map((call) => call.model)).toEqual(["good"]);
+    expect(calls[0]!.prompt).not.toContain("The previous model");
+    expect(result.model).toBe("mock/good");
+    expect(cooldowns).toEqual({});
+  });
+
+  it("surfaces a model listing failure instead of cooling models down", async () => {
+    await fs.writeFile(path.join(root, "bin", "list-fails"), "");
+    await expect(run({ model: "mock/quota", fallbackModels: ["mock/good"] })).rejects.toThrow();
+    expect(JSON.parse(await fs.readFile(cooldownsFile, "utf8").catch(() => "{}"))).toEqual({});
+  });
+
+  it("never marks a run replayable once a tool ran, even past the captured stdout tail", async () => {
+    const { result } = await run({ model: "mock/bigtool" });
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.resultJson).not.toHaveProperty("executionRecovery");
+  });
+
+  it("keeps single-model behavior and marks provider failures without tool work as replayable", async () => {
+    const { result, calls } = await run({ model: "mock/flaky" });
+    expect(calls.map((call) => call.model)).toEqual(["flaky"]);
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.resultJson).toMatchObject({ executionRecovery: { kind: "bootstrap", providerWorkStarted: false } });
+    await expect(run({ model: "mock/gone" })).rejects.toThrow("Configured Pi model is unavailable: mock/gone");
+  });
+});

@@ -56,6 +56,13 @@ import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { classifyPiProviderFailure, isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { compactPiRunLogLine } from "./log-compaction.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
+import {
+  createPiModelCooldownStore,
+  earliestPiChainRecovery,
+  planPiModelAttempts,
+  resolvePiModelChain,
+  type PiModelCooldown,
+} from "./model-fallback.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -85,6 +92,13 @@ function parseModelId(model: string | null): string | null {
   const trimmed = model.trim();
   if (!trimmed.includes("/")) return trimmed || null;
   return trimmed.slice(trimmed.indexOf("/") + 1).trim() || null;
+}
+
+const PI_TOOL_EXECUTION_START_RE = /^\{\s*"type"\s*:\s*"tool_execution_start"/;
+const PI_MODEL_UNAVAILABLE_PREFIX = "Configured Pi model is unavailable:";
+
+function formatCooldownUntil(cooldown: PiModelCooldown): string {
+  return `${cooldown.kind === "hard" ? "quota" : "transient"} cooldown until ${cooldown.until}`;
 }
 
 async function ensurePiSkillsInjected(
@@ -238,10 +252,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const command = asString(config.command, "pi");
   const model = asString(config.model, "").trim();
   const thinking = asString(config.thinking, "").trim();
-
-  // Parse model into provider and model id
-  const provider = parseModelProvider(model);
-  const modelId = parseModelId(model);
+  const modelChain = resolvePiModelChain(config);
 
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -394,13 +405,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       resolvedCommand,
     });
 
-    if (!executionTargetIsRemote) {
-      await ensurePiModelConfiguredAndAvailable({
-        model,
-        command,
-        cwd,
-        env: runtimeEnv,
-      });
+    if (!executionTargetIsRemote && !model) {
+      // Fails with the "model required" error; each candidate model of the
+      // chain is checked for availability right before its attempt.
+      await ensurePiModelConfiguredAndAvailable({ model, command, cwd, env: runtimeEnv });
     }
 
     const extraArgs = (() => {
@@ -666,7 +674,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return notes;
     })();
 
-    const buildArgs = (sessionFile: string): string[] => {
+    const buildArgs = (sessionFile: string, attemptModel: string, prompt: string): string[] => {
       const args: string[] = [];
 
       // Use JSON mode for structured output with print mode (non-interactive)
@@ -676,6 +684,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Use --append-system-prompt to extend Pi's default system prompt
       args.push("--append-system-prompt", renderedSystemPromptExtension);
 
+      const provider = parseModelProvider(attemptModel);
+      const modelId = parseModelId(attemptModel);
       if (provider) args.push("--provider", provider);
       if (modelId) args.push("--model", modelId);
       if (thinking) args.push("--thinking", thinking);
@@ -687,13 +697,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (extraArgs.length > 0) args.push(...extraArgs);
 
       // Add the user prompt as the last argument
-      args.push(userPrompt);
+      args.push(prompt);
 
       return args;
     };
 
-    const runAttempt = async (sessionFile: string) => {
-      const args = buildArgs(sessionFile);
+    const runAttempt = async (sessionFile: string, attemptModel: string, prompt: string) => {
+      const args = buildArgs(sessionFile, attemptModel, prompt);
       if (onMeta) {
         await onMeta({
           adapterType: "pi_local",
@@ -702,7 +712,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           commandNotes,
           commandArgs: args,
           env: loggedEnv,
-          prompt: userPrompt,
+          prompt,
           promptMetrics,
           context,
         });
@@ -710,6 +720,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       // Buffer stdout by lines to handle partial JSON chunks
       let stdoutBuffer = "";
+      // proc.stdout keeps only a capped tail, so tool activity is tracked on
+      // the full stream: it decides whether a failed run may be replayed.
+      let toolStarted = false;
+      const noteToolStart = (line: string) => {
+        if (!toolStarted && PI_TOOL_EXECUTION_START_RE.test(line.slice(0, 64))) toolStarted = true;
+      };
       const bufferedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
         if (stream === "stderr") {
           // Pass stderr through immediately (not JSONL)
@@ -725,6 +741,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
         // Emit complete lines, keeping only the events the transcript reads
         for (const line of lines) {
+          noteToolStart(line);
           const logged = line ? compactPiRunLogLine(line) : null;
           if (logged !== null) {
             await onLog(stream, logged + "\n");
@@ -745,26 +762,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
 
       // Flush any remaining buffer content
+      noteToolStart(stdoutBuffer);
       const loggedTail = stdoutBuffer ? compactPiRunLogLine(stdoutBuffer) : null;
       if (loggedTail !== null) {
         await onLog("stdout", loggedTail);
       }
 
+      const parsed = parsePiJsonl(proc.stdout);
       return {
         proc,
         rawStderr: proc.stderr,
-        parsed: parsePiJsonl(proc.stdout),
+        parsed,
+        toolStarted: toolStarted || parsed.toolCalls.length > 0,
       };
     };
 
+    type PiAttempt = Awaited<ReturnType<typeof runAttempt>>;
+
     const toResult = (
-      attempt: {
-        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
-        rawStderr: string;
-        parsed: ReturnType<typeof parsePiJsonl>;
-      },
-      clearSessionOnMissingSession = false,
+      attempt: PiAttempt,
+      options: { model: string; clearSession: boolean; providerWorkStarted: boolean },
     ): AdapterExecutionResult => {
+      const clearSessionOnMissingSession = options.clearSession;
+      const provider = parseModelProvider(options.model);
       if (attempt.proc.timedOut) {
         return {
           exitCode: attempt.proc.exitCode,
@@ -831,7 +851,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         sessionDisplayId: resolvedSessionId,
         provider: provider,
         biller: resolvePiBiller(runtimeEnv, provider),
-        model: model,
+        model: options.model,
         billingType: "unknown",
         costUsd: attempt.parsed.usage.costUsd,
         resultJson: {
@@ -842,51 +862,206 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ...(providerFailure?.errorFamily === "provider_quota" && retryNotBefore
             ? { providerQuotaRetryNotBefore: retryNotBefore }
             : {}),
+          // No tool ran in this run, so the server may replay it automatically
+          // instead of holding it for board reconciliation.
+          ...(providerFailure && !options.providerWorkStarted
+            ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
+            : {}),
         },
         summary: attempt.parsed.finalMessage ?? attempt.parsed.messages.join("\n\n").trim(),
         clearSession: Boolean(clearSessionOnMissingSession),
       };
     };
 
-    try {
-      const initial = await runAttempt(sessionPath);
-      const initialFailed =
-        !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || initial.parsed.errors.length > 0);
+    // Every model of the chain is cooling down: fail before spawning Pi and let
+    // the server retry when the first one recovers.
+    const toChainCoolingDownResult = (
+      recovery: { model: string; cooldown: PiModelCooldown },
+    ): AdapterExecutionResult => {
+      const errorFamily = recovery.cooldown.kind === "hard" ? "provider_quota" : "transient_upstream";
+      const retryNotBefore = recovery.cooldown.until;
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage:
+          `All Pi models are cooling down (${modelChain.join(", ")}); ` +
+          `${recovery.model} is next available at ${retryNotBefore}.`,
+        errorCode: errorFamily === "provider_quota" ? "provider_quota" : "pi_transient_upstream",
+        errorFamily,
+        retryNotBefore,
+        model: recovery.model,
+        provider: parseModelProvider(recovery.model),
+        resultJson: {
+          errorFamily,
+          retryNotBefore,
+          transientRetryNotBefore: retryNotBefore,
+          ...(errorFamily === "provider_quota" ? { providerQuotaRetryNotBefore: retryNotBefore } : {}),
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        },
+        clearSession: false,
+      };
+    };
 
-      if (
-        canResumeSession &&
-        initialFailed &&
-        isPiUnknownSessionError(initial.proc.stdout, initial.rawStderr)
-      ) {
-        await onLog(
-          "stdout",
-          `[paperclip] Pi session "${runtimeSessionId}" is unavailable; retrying with a fresh session.\n`,
-        );
-        const newSessionPath = executionTargetIsRemote && remoteRuntimeRootDir
-          ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
-          : buildSessionPath(agent.id, new Date().toISOString());
-        if (executionTargetIsRemote) {
-          await ensureAdapterExecutionTargetFile(runId, executionTarget, newSessionPath, {
-            cwd,
-            env,
-            timeoutSec: 15,
-            graceSec: 5,
-            onLog,
-          });
-        } else {
+    const isAttemptFailed = (attempt: PiAttempt) =>
+      !attempt.proc.timedOut && ((attempt.proc.exitCode ?? 0) !== 0 || attempt.parsed.errors.length > 0);
+
+    try {
+      const cooldownStore = createPiModelCooldownStore();
+      const plan = planPiModelAttempts(modelChain, await cooldownStore.read(), new Date());
+      for (const { model: skippedModel, cooldown } of plan.skipped) {
+        await onLog("stdout", `[paperclip] Skipping Pi model ${skippedModel}: ${formatCooldownUntil(cooldown)}.\n`);
+      }
+      if (plan.candidates.length === 0) {
+        const recovery = earliestPiChainRecovery(modelChain, await cooldownStore.read(), new Date());
+        if (recovery) return toChainCoolingDownResult(recovery);
+      }
+      const candidates = plan.candidates.length > 0 ? plan.candidates : [model];
+
+      let attemptSessionPath = sessionPath;
+      let attemptPrompt = userPrompt;
+      let sessionReset = false;
+      let providerWorkStarted = false;
+      let lastResult: AdapterExecutionResult | null = null;
+      const attempts: Array<{
+        model: string;
+        errorFamily: string | null;
+        usage: AdapterExecutionResult["usage"] | null;
+        costUsd: number | null;
+      }> = [];
+
+      // Failed attempts spent tokens too: account for the whole run.
+      const withRunTotals = (result: AdapterExecutionResult): AdapterExecutionResult => {
+        if (attempts.length <= 1) return result;
+        const usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+        let costUsd = 0;
+        for (const entry of attempts) {
+          usage.inputTokens += entry.usage?.inputTokens ?? 0;
+          usage.outputTokens += entry.usage?.outputTokens ?? 0;
+          usage.cachedInputTokens += entry.usage?.cachedInputTokens ?? 0;
+          costUsd += entry.costUsd ?? 0;
+        }
+        return { ...result, usage, costUsd, resultJson: { ...result.resultJson, modelAttempts: attempts } };
+      };
+
+      // The chain is exhausted: retry when its first model recovers.
+      const withChainRecovery = async (result: AdapterExecutionResult): Promise<AdapterExecutionResult> => {
+        if (modelChain.length <= 1 || !result.errorFamily) return result;
+        const recovery = earliestPiChainRecovery(modelChain, await cooldownStore.read(), new Date());
+        if (!recovery || recovery.cooldown.until === result.retryNotBefore) return result;
+        const retryNotBefore = recovery.cooldown.until;
+        return {
+          ...result,
+          retryNotBefore,
+          resultJson: {
+            ...result.resultJson,
+            retryNotBefore,
+            transientRetryNotBefore: retryNotBefore,
+            ...(result.errorFamily === "provider_quota" ? { providerQuotaRetryNotBefore: retryNotBefore } : {}),
+          },
+        };
+      };
+
+      for (const [index, candidate] of candidates.entries()) {
+        const nextCandidate = candidates[index + 1] ?? null;
+        if (!executionTargetIsRemote) {
           try {
-            await fs.writeFile(newSessionPath, "", { flag: "wx" });
+            await ensurePiModelConfiguredAndAvailable({ model: candidate, command, cwd, env: runtimeEnv });
           } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
-              throw err;
-            }
+            // Only a model missing from a successful listing moves down the
+            // chain, for this run only: a listing failure or this agent's own
+            // env says nothing about the provider, so nothing is shared.
+            const reason = err instanceof Error ? err.message : String(err);
+            if (!reason.startsWith(PI_MODEL_UNAVAILABLE_PREFIX) || (!nextCandidate && !lastResult)) throw err;
+            await onLog(
+              "stdout",
+              `[paperclip] Pi model ${candidate} is not listed by Pi` +
+                (nextCandidate ? `; falling back to ${nextCandidate}.\n` : ".\n"),
+            );
+            if (nextCandidate) continue;
+            break;
           }
         }
-        const retry = await runAttempt(newSessionPath);
-        return toResult(retry, true);
+
+        let attempt = await runAttempt(attemptSessionPath, candidate, attemptPrompt);
+        if (
+          !lastResult &&
+          canResumeSession &&
+          isAttemptFailed(attempt) &&
+          isPiUnknownSessionError(attempt.proc.stdout, attempt.rawStderr)
+        ) {
+          await onLog(
+            "stdout",
+            `[paperclip] Pi session "${runtimeSessionId}" is unavailable; retrying with a fresh session.\n`,
+          );
+          const newSessionPath = executionTargetIsRemote && remoteRuntimeRootDir
+            ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
+            : buildSessionPath(agent.id, new Date().toISOString());
+          if (executionTargetIsRemote) {
+            await ensureAdapterExecutionTargetFile(runId, executionTarget, newSessionPath, {
+              cwd,
+              env,
+              timeoutSec: 15,
+              graceSec: 5,
+              onLog,
+            });
+          } else {
+            try {
+              await fs.writeFile(newSessionPath, "", { flag: "wx" });
+            } catch (err) {
+              if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+                throw err;
+              }
+            }
+          }
+          attemptSessionPath = newSessionPath;
+          sessionReset = true;
+          attempt = await runAttempt(attemptSessionPath, candidate, attemptPrompt);
+        }
+
+        providerWorkStarted ||= attempt.toolStarted;
+        const result = toResult(attempt, { model: candidate, clearSession: sessionReset, providerWorkStarted });
+        attempts.push({
+          model: candidate,
+          errorFamily: result.errorFamily ?? null,
+          usage: result.usage ?? null,
+          costUsd: result.costUsd ?? null,
+        });
+        lastResult = result;
+
+        if (result.timedOut) return withRunTotals(result);
+        if ((result.exitCode ?? 0) === 0) {
+          await cooldownStore.recordSuccess(candidate);
+          if (candidate !== model) {
+            await onLog("stdout", `[paperclip] Run completed on fallback Pi model ${candidate}.\n`);
+          }
+          return withRunTotals(result);
+        }
+        // Only provider availability failures move down the chain; anything
+        // else (auth, prompt, tool or agent errors) is the run's real outcome.
+        if (result.errorFamily !== "provider_quota" && result.errorFamily !== "transient_upstream") {
+          return withRunTotals(result);
+        }
+        const { cooldown } = await cooldownStore.recordFailure({
+          model: candidate,
+          kind: result.errorFamily === "provider_quota" ? "hard" : "soft",
+          retryNotBefore: result.retryNotBefore ? new Date(result.retryNotBefore) : null,
+          reason: result.errorMessage ?? result.errorFamily,
+        });
+        if (!nextCandidate) break;
+        await onLog(
+          "stdout",
+          `[paperclip] Pi model ${candidate} failed (${formatCooldownUntil(cooldown)}); ` +
+            `falling back to ${nextCandidate} in the same session.\n`,
+        );
+        attemptPrompt =
+          `The previous model (${candidate}) stopped because its provider is unavailable ` +
+          `(${result.errorFamily === "provider_quota" ? "usage quota reached" : "transient provider error"}). ` +
+          "Continue the task from where it left off.";
       }
 
-      return toResult(initial);
+      if (lastResult) return withChainRecovery(withRunTotals(lastResult));
+      throw new Error(`No Pi model of the chain is available: ${modelChain.join(", ")}`);
     } finally {
       await Promise.all([
         paperclipBridge?.stop(),

@@ -41,7 +41,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
-import { FolderOpen, Heart, ChevronDown, X, Copy, Check, ExternalLink, Loader2, TriangleAlert, Bug } from "lucide-react";
+import { FolderOpen, Heart, ChevronDown, X, Copy, Check, ExternalLink, Loader2, TriangleAlert, Bug, Plus } from "lucide-react";
 import { asBoolean, asFiniteNumber, asObject, cn } from "../lib/utils";
 import { copyTextToClipboard } from "../lib/clipboard";
 import {
@@ -1246,6 +1246,12 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     ? val!.model ?? ""
     : eff("adapterConfig", "model", String(config.model ?? ""));
   const currentModelId = typeof currentModelValue === "string" ? currentModelValue : "";
+  const currentFallbackModelsValue = isCreate
+    ? undefined
+    : eff<unknown>("adapterConfig", "fallbackModels", config.fallbackModels);
+  const currentFallbackModels = Array.isArray(currentFallbackModelsValue)
+    ? currentFallbackModelsValue.filter((entry): entry is string => typeof entry === "string")
+    : [];
 
   async function handleRefreshModels() {
     if (!selectedCompanyId) return;
@@ -1754,6 +1760,15 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 detectModelLabel="Detect model"
                 emptyDetectHint="No model detected. Select or enter one manually."
               />
+              {!isCreate && adapterType === "pi_local" && (
+                <FallbackModelDropdowns
+                  models={models}
+                  values={currentFallbackModels}
+                  onChange={(next) => mark("adapterConfig", "fallbackModels", next.length > 0 ? next : undefined)}
+                  onRefreshModels={supportsAdapterModelRefresh(adapterType) ? handleRefreshModels : undefined}
+                  refreshingModels={refreshingModels}
+                />
+              )}
               {(refreshModelsError || fetchedModelsError) && (
                 <p className="text-xs text-destructive">
                   {refreshModelsError
@@ -3700,6 +3715,9 @@ export function ModelDropdown({
   detectModelLabel,
   emptyDetectHint,
   defaultLabel,
+  label = "Model",
+  hint = help.model,
+  onRemove,
 }: {
   models: AdapterModel[];
   value: string;
@@ -3718,6 +3736,9 @@ export function ModelDropdown({
   detectModelLabel?: string;
   emptyDetectHint?: string;
   defaultLabel?: string;
+  label?: string;
+  hint?: string;
+  onRemove?: () => void;
 }) {
   const [modelSearch, setModelSearch] = useState("");
   const [detectingModel, setDetectingModel] = useState(false);
@@ -3790,8 +3811,7 @@ export function ModelDropdown({
     }
   }
 
-  return (
-    <Field label="Model" hint={help.model}>
+  const picker = (
       <Popover
         open={open}
         onOpenChange={(nextOpen) => {
@@ -3997,7 +4017,69 @@ export function ModelDropdown({
           </div>
         </PopoverContent>
       </Popover>
+  );
+
+  return (
+    <Field label={label} hint={hint}>
+      {onRemove ? (
+        <div className="flex items-center gap-1.5">
+          <div className="min-w-0 flex-1">{picker}</div>
+          <Button type="button" variant="ghost" size="icon-xs" aria-label={`Remove ${label}`} onClick={onRemove}>
+            <X />
+          </Button>
+        </div>
+      ) : picker}
     </Field>
+  );
+}
+
+/** Ordered backup models an adapter switches to when the primary model is unavailable. */
+function FallbackModelDropdowns({
+  models,
+  values,
+  onChange,
+  onRefreshModels,
+  refreshingModels,
+}: {
+  models: AdapterModel[];
+  values: string[];
+  onChange: (values: string[]) => void;
+  onRefreshModels?: () => Promise<void>;
+  refreshingModels?: boolean;
+}) {
+  const [openIndex, setOpenIndex] = useState<number | null>(null);
+  return (
+    <>
+      {values.map((value, index) => (
+        <ModelDropdown
+          key={index}
+          label={`Fallback model ${index + 1}`}
+          hint={help.fallbackModels}
+          models={models}
+          value={value}
+          onChange={(next) => onChange(values.map((current, i) => (i === index ? next : current)))}
+          open={openIndex === index}
+          onOpenChange={(nextOpen) => setOpenIndex(nextOpen ? index : null)}
+          allowDefault={false}
+          required
+          groupByProvider
+          creatable
+          onRefreshModels={onRefreshModels}
+          refreshingModels={refreshingModels}
+          onRemove={() => onChange(values.filter((_, i) => i !== index))}
+        />
+      ))}
+      <Button
+        type="button"
+        variant="ghost"
+        size="xs"
+        className="self-start text-muted-foreground"
+        onClick={() => onChange([...values, ""])}
+      >
+        <Plus />
+        Add fallback model
+      </Button>
+    </>
   );
 }
 
