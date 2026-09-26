@@ -247,7 +247,7 @@ export function isPiUnknownSessionError(stdout: string, stderr: string): boolean
 const PI_PROVIDER_QUOTA_RE =
   /(?:usage_limit_reached|usage\s+limit\s+(?:has\s+been\s+)?(?:reached|exceeded)|insufficient_quota|exceeded\s+your\s+current\s+quota|quota\s+(?:limit\s+)?exceeded|you(?:'|’)ve\s+hit\s+your\s+(?:\w+\s+)?limit|out\s+of\s+extra\s+usage|(?:5[-\s]?hour|weekly|session)\s+limit\s+reached)/i;
 const PI_TRANSIENT_UPSTREAM_RE =
-  /(?:\b(?:429|500|502|503|504|529)\b|rate[-\s_]?limit|too\s+many\s+requests|model_cooldown|cooling\s+down|overloaded|service\s+unavailable|temporarily\s+unavailable|high\s+demand|try\s+again\s+later|no\s+(?:allowed\s+)?(?:providers|endpoints)\s+(?:are\s+)?available|ECONNRESET|ETIMEDOUT|socket\s+hang\s+up|fetch\s+failed)/i;
+  /(?:\b(?:429|500|502|503|504|529)\b|rate[-\s_]?limit|too\s+many\s+requests|model_cooldown|cooling\s+down|overloaded|service\s+unavailable|temporarily\s+unavailable|high\s+demand|try\s+again\s+later|no\s+(?:allowed\s+)?(?:providers|endpoints)\s+(?:are\s+)?available|ECONNRESET|ETIMEDOUT|socket\s+hang\s+up|fetch\s+failed|error\s+injected\s+into\s+sse\s+stream|provider\s+returned\s+error)/i;
 const PI_RETRY_AFTER_SECONDS_RE =
   /"?(?:resets_in_seconds|reset_seconds|retry_after_seconds|retry_after)"?\s*[:=]\s*"?(\d+(?:\.\d+)?)/i;
 const PI_RESETS_AT_RE = /"?resets_at"?\s*[:=]\s*"?(\d{10,13})\b/i;

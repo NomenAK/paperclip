@@ -316,6 +316,9 @@ describe("classifyPiProviderFailure", () => {
       "503 No endpoints available for this model",
       "Provider overloaded, try again later",
       "fetch failed: ECONNRESET",
+      // OpenRouter reports an upstream failure mid-stream this way.
+      "JSON error injected into SSE stream",
+      '{"error":{"message":"Provider returned error","code":502}}',
     ]) {
       expect(classifyPiProviderFailure({ errors: [error] }, now)).toEqual({
         errorFamily: "transient_upstream",
