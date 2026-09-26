@@ -29,6 +29,7 @@ export const help: Record<string, string> = {
   cwd: "Deprecated legacy working directory fallback for local adapters. Existing agents may still carry this value, but new configurations should use project workspaces instead.",
   promptTemplate: "Sent on every heartbeat. Keep this small and dynamic. Use it for current-task framing, not large static instructions. Supports {{ agent.id }}, {{ agent.name }}, {{ agent.role }} and other template variables.",
   model: "Override the default model used by the adapter.",
+  fallbackModels: "Tried in order when the models above are unavailable. A quota failure skips a model until its announced reset (1 h if unknown); a transient failure skips it for 1 min, doubling up to 30 min. Cooldowns are shared by all agents.",
   thinkingEffort: "Control model reasoning depth. Supported values vary by adapter/model.",
   chrome: "Enable Claude's Chrome integration by passing --chrome.",
   dangerouslySkipPermissions: "Run unattended by auto-approving adapter permission prompts when supported.",

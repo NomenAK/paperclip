@@ -784,6 +784,34 @@ describe("AgentConfigForm environment selector", () => {
     expect(result.onSave.mock.calls[0][0].adapterConfig.effort).toBeUndefined();
   });
 
+  it("edits the ordered Pi fallback models under the primary model", async () => {
+    const result = await renderForm([], {
+      adapterType: "pi_local",
+      adapterConfig: { model: "cpa/claude-opus-5-5", fallbackModels: ["cpa/gpt-6-sol", "openrouter/stealth/space-bunny-alpha"] },
+    });
+    roots.push(result.root);
+    const labels = () => [...result.container.querySelectorAll("label")].map((label) => label.textContent?.trim());
+    expect(labels()).toEqual(expect.arrayContaining(["Model", "Fallback model 1", "Fallback model 2"]));
+
+    const removeFirst = result.container.querySelector<HTMLButtonElement>('button[aria-label="Remove Fallback model 1"]')!;
+    await act(async () => removeFirst.click());
+    await flushReact();
+    const add = [...result.container.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Add fallback model")!;
+    await act(async () => add.click());
+    await flushReact();
+    expect(labels()).toEqual(expect.arrayContaining(["Fallback model 1", "Fallback model 2"]));
+
+    const save = [...result.container.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Save")!;
+    await act(async () => save.click());
+    expect(result.onSave.mock.calls[0][0].adapterConfig.fallbackModels).toEqual(["openrouter/stealth/space-bunny-alpha", ""]);
+  });
+
+  it("does not offer fallback models for adapters that do not run them", async () => {
+    const result = await renderForm([], { adapterType: "claude_local", adapterConfig: {} });
+    roots.push(result.root);
+    expect(result.container.textContent).not.toContain("Add fallback model");
+  });
+
   it("hides the environment override when Local is the only configured environment", async () => {
     const result = await renderForm([
       makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
