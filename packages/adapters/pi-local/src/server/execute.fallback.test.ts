@@ -13,7 +13,7 @@ const path = require("node:path");
 const args = process.argv.slice(2);
 if (args.includes("--list-models")) {
   if (fs.existsSync(path.join(__dirname, "list-fails"))) process.exit(1);
-  process.stderr.write("provider  model  context\nmock  quota  1M\nmock  flaky  1M\nmock  good  1M\nmock  badauth  1M\nmock  bigtool  1M\n");
+  process.stderr.write("provider  model  context\nmock  quota  1M\nmock  flaky  1M\nmock  good  1M\nmock  badauth  1M\nmock  bigtool  1M\nmock  killed  1M\nmock  killedsession  1M\n");
   process.exit(0);
 }
 const arg = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : ""; };
@@ -27,6 +27,15 @@ if (model === "quota") {
   fail('429: {"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":7200}');
 } else if (model === "flaky") fail("503 Service Unavailable: model overloaded");
 else if (model === "badauth") fail("401 invalid api key");
+else if (model === "killed") {
+  // The control plane stopped Pi (run cancelled/reassigned) mid-stream.
+  fail("503 Service Unavailable: model overloaded");
+  process.exit(143);
+}
+else if (model === "killedsession") {
+  process.stderr.write("session not found\n");
+  process.exit(143);
+}
 else if (model === "bigtool") {
   // A tool runs, then over 4 MB of streaming updates push it out of the
   // captured stdout tail before the provider fails.
@@ -71,14 +80,14 @@ beforeEach(async () => {
   await fs.rm(path.join(root, "bin", "calls.log"), { force: true });
 });
 
-async function run(config: Record<string, unknown>) {
+async function run(config: Record<string, unknown>, sessionId?: string) {
   const logs: string[] = [];
   const workspace = path.join(root, "workspace");
   await fs.mkdir(workspace, { recursive: true });
   const result = await execute({
     runId: "run-1",
     agent: { id: "agent-1", companyId: "company-1", name: "Pi", adapterType: "pi_local", adapterConfig: {} },
-    runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+    runtime: { sessionId: sessionId ?? null, sessionParams: null, sessionDisplayId: null, taskKey: null },
     config: { command: fakePi, ...config },
     context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
     onLog: async (_stream: string, chunk: string) => {
@@ -215,5 +224,23 @@ describe("pi model fallback chain", () => {
     await expect(run({ model: "mock/gone" })).rejects.toThrow(
       /^Configured Pi model is unavailable: mock\/gone\. Available models: mock\//,
     );
+  });
+
+  it("does not fall back when the control plane stopped Pi", async () => {
+    const { result, calls, cooldowns } = await run({ model: "mock/killed", fallbackModels: ["mock/good"] });
+    expect(calls.map((call) => call.model)).toEqual(["killed"]);
+    expect(result.exitCode).toBe(143);
+    expect(cooldowns["mock/killed"]).toBeUndefined();
+  });
+
+  it("does not respawn a stopped Pi with a fresh session", async () => {
+    const workspace = path.join(root, "workspace");
+    await fs.mkdir(workspace, { recursive: true });
+    const sessionFile = path.join(root, "saved-session.jsonl");
+    await fs.writeFile(sessionFile, JSON.stringify({ type: "session", cwd: workspace }) + "\n");
+    const { result, calls, log } = await run({ model: "mock/killedsession" }, sessionFile);
+    expect(calls.map((call) => call.session)).toEqual([sessionFile]);
+    expect(log).not.toContain("retrying with a fresh session");
+    expect(result.exitCode).toBe(143);
   });
 });
