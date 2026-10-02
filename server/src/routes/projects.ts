@@ -36,6 +36,7 @@ import {
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectProjectExecutionWorkspaceCommandPaths,
+  collectProjectExecutionWorkspaceCommandMutationPaths,
   collectProjectWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import { assertCanManageProjectWorkspaceRuntimeServices } from "./workspace-runtime-service-authz.js";
@@ -326,15 +327,15 @@ export function projectRoutes(db: Db) {
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
     const body = { ...req.body };
-    assertNoAgentHostWorkspaceCommandMutation(
-      req,
-      [
-        ...collectProjectExecutionWorkspaceCommandPaths(body.executionWorkspacePolicy),
-        ...(body.executionWorkspacePolicy !== undefined
-          ? collectProjectExecutionWorkspaceCommandPaths(existing.executionWorkspacePolicy)
-          : []),
-      ],
-    );
+    if (req.actor.type === "agent" && body.executionWorkspacePolicy !== undefined) {
+      assertNoAgentHostWorkspaceCommandMutation(
+        req,
+        collectProjectExecutionWorkspaceCommandMutationPaths(
+          existing.executionWorkspacePolicy,
+          body.executionWorkspacePolicy,
+        ),
+      );
+    }
     await assertProjectEnvironmentSelection(
       existing.companyId,
       readProjectPolicyEnvironmentId(body.executionWorkspacePolicy),

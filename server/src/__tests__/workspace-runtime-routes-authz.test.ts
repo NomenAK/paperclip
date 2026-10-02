@@ -479,6 +479,103 @@ describe.sequential("workspace runtime service route authorization", () => {
     expect(mockProjectService.update).toHaveBeenCalledWith(projectId, { name: "Renamed" });
   });
 
+  it.each([
+    ["identical policy", {}],
+    ["shared workspace concurrency", { sharedWorkspaceConcurrency: "serialize" }],
+    ["branch template", { workspaceStrategy: { type: "git_worktree", provisionCommand: "echo host-only", branchTemplate: "safe/{issueIdentifier}" } }],
+  ])("allows agent PATCH preserving host commands when resending %s", async (_name, changes) => {
+    const policy = {
+      enabled: true,
+      workspaceStrategy: { type: "git_worktree", provisionCommand: "echo host-only" },
+    };
+    mockProjectService.getById.mockResolvedValue(buildProject({ executionWorkspacePolicy: policy }));
+    const updatedPolicy = { ...policy, ...changes };
+    mockProjectService.update.mockResolvedValue(buildProject({ executionWorkspacePolicy: updatedPolicy }));
+    const app = await createProjectApp({
+      type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key", runId: "run-1",
+    });
+
+    const res = await request(app).patch(`/api/projects/${projectId}`).send({ executionWorkspacePolicy: updatedPolicy });
+
+    expect(res.status).toBe(200);
+    expect(res.body.executionWorkspacePolicy).toEqual(updatedPolicy);
+  });
+
+  it.each([
+    ["added", null, { enabled: true, workspaceStrategy: { provisionCommand: "echo host-only" } }],
+    ["changed", { enabled: true, workspaceStrategy: { provisionCommand: "echo host-only" } }, { enabled: true, workspaceStrategy: { provisionCommand: "echo changed" } }],
+    ["cleared policy", { enabled: true, workspaceStrategy: { provisionCommand: "echo host-only" } }, null],
+    ["cleared strategy", { enabled: true, workspaceStrategy: { provisionCommand: "echo host-only" } }, { enabled: true, workspaceStrategy: null }],
+    ["omitted null command", { enabled: true, workspaceStrategy: { provisionCommand: null } }, { enabled: true }],
+  ])("rejects agent PATCH with %s provision command", async (_name, before, after) => {
+    mockProjectService.getById.mockResolvedValue(buildProject({ executionWorkspacePolicy: before }));
+    const app = await createProjectApp({
+      type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key", runId: "run-1",
+    });
+
+    const res = await request(app).patch(`/api/projects/${projectId}`).send({ executionWorkspacePolicy: after });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("executionWorkspacePolicy.workspaceStrategy.provisionCommand");
+    expect(mockProjectService.update).not.toHaveBeenCalled();
+  });
+
+  it.each(["commands", "services", "jobs"])("compares agent PATCH runtime %s commands by value and array position", async (collection) => {
+    const policy = {
+      enabled: true,
+      workspaceRuntime: { [collection]: [null, { name: "host", command: "echo host-only" }] },
+    };
+    mockProjectService.getById.mockResolvedValue(buildProject({ executionWorkspacePolicy: policy }));
+    mockProjectService.update.mockResolvedValue(buildProject({ executionWorkspacePolicy: policy }));
+    const app = await createProjectApp({
+      type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key", runId: "run-1",
+    });
+
+    const unchanged = await request(app).patch(`/api/projects/${projectId}`).send({ executionWorkspacePolicy: policy });
+    expect(unchanged.status).toBe(200);
+    expect(unchanged.body.executionWorkspacePolicy).toEqual(policy);
+    mockProjectService.update.mockClear();
+
+    for (const entries of [[], [null, { command: "echo changed" }], [{ command: "echo host-only" }]]) {
+      const res = await request(app).patch(`/api/projects/${projectId}`).send({
+        executionWorkspacePolicy: { enabled: true, workspaceRuntime: { [collection]: entries } },
+      });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain(`executionWorkspacePolicy.workspaceRuntime.${collection}[1].command`);
+    }
+    expect(mockProjectService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["no host commands", { enabled: true }, { enabled: true, sharedWorkspaceConcurrency: "serialize" }],
+    ["unchanged null command", { enabled: true, workspaceStrategy: { provisionCommand: null } }, { enabled: true, workspaceStrategy: { provisionCommand: null }, defaultMode: "isolated_workspace" }],
+    ["descriptive runtime entries", { enabled: true, workspaceRuntime: { jobs: [null, [], { name: "old" }] } }, { enabled: true, workspaceRuntime: { jobs: [{ name: "new" }] } }],
+  ])("allows agent policy changes with %s", async (_name, before, after) => {
+    mockProjectService.getById.mockResolvedValue(buildProject({ executionWorkspacePolicy: before }));
+    mockProjectService.update.mockResolvedValue(buildProject({ executionWorkspacePolicy: after }));
+    const app = await createProjectApp({
+      type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key", runId: "run-1",
+    });
+
+    const res = await request(app).patch(`/api/projects/${projectId}`).send({ executionWorkspacePolicy: after });
+
+    expect(res.status).toBe(200);
+    expect(res.body.executionWorkspacePolicy).toEqual(after);
+  });
+
+  it("allows board policy replacements removing host commands", async () => {
+    mockProjectService.getById.mockResolvedValue(buildProject({
+      executionWorkspacePolicy: { enabled: true, workspaceStrategy: { provisionCommand: "echo host-only" } },
+    }));
+    mockProjectService.update.mockResolvedValue(buildProject({ executionWorkspacePolicy: null }));
+    const app = await createProjectApp({ type: "board", userId: "user-1", source: "local_implicit" });
+
+    const res = await request(app).patch(`/api/projects/${projectId}`).send({ executionWorkspacePolicy: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.executionWorkspacePolicy).toBeNull();
+  });
+
   it("rejects agent callers that create project execution workspace commands", async () => {
     const app = await createProjectApp({
       type: "agent",

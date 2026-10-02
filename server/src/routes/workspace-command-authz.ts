@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { Request } from "express";
 import { forbidden } from "../errors.js";
 
@@ -13,22 +14,25 @@ function prefixPath(prefix: string, key: string) {
   return prefix.length > 0 ? `${prefix}.${key}` : key;
 }
 
-function collectWorkspaceStrategyCommandPaths(raw: unknown, prefix: string): string[] {
+function collectWorkspaceStrategyCommandPaths(raw: unknown, prefix: string, commands?: Map<string, unknown>): string[] {
   if (!isRecord(raw)) return [];
   const paths: string[] = [];
   if (hasOwn(raw, "provisionCommand")) {
     paths.push(prefixPath(prefix, "provisionCommand"));
+    commands?.set(prefixPath(prefix, "provisionCommand"), raw.provisionCommand);
   }
   if (hasOwn(raw, "runtimeProvisionCommand")) {
     paths.push(prefixPath(prefix, "runtimeProvisionCommand"));
+    commands?.set(prefixPath(prefix, "runtimeProvisionCommand"), raw.runtimeProvisionCommand);
   }
   if (hasOwn(raw, "teardownCommand")) {
     paths.push(prefixPath(prefix, "teardownCommand"));
+    commands?.set(prefixPath(prefix, "teardownCommand"), raw.teardownCommand);
   }
   return paths;
 }
 
-function collectWorkspaceRuntimeCommandPaths(raw: unknown, prefix: string): string[] {
+function collectWorkspaceRuntimeCommandPaths(raw: unknown, prefix: string, commands?: Map<string, unknown>): string[] {
   if (!isRecord(raw)) return [];
   const paths: string[] = [];
   for (const collectionKey of ["commands", "services", "jobs"] as const) {
@@ -37,6 +41,7 @@ function collectWorkspaceRuntimeCommandPaths(raw: unknown, prefix: string): stri
     entries.forEach((entry, index) => {
       if (isRecord(entry) && hasOwn(entry, "command")) {
         paths.push(`${prefixPath(prefix, collectionKey)}[${index}].command`);
+        commands?.set(`${prefixPath(prefix, collectionKey)}[${index}].command`, entry.command);
       }
     });
   }
@@ -85,18 +90,31 @@ export function collectAgentAdapterWorkspaceCommandPaths(
   );
 }
 
-export function collectProjectExecutionWorkspaceCommandPaths(policy: unknown): string[] {
+export function collectProjectExecutionWorkspaceCommandPaths(policy: unknown, commands?: Map<string, unknown>): string[] {
   if (!isRecord(policy)) return [];
   return [
     ...collectWorkspaceStrategyCommandPaths(
       policy.workspaceStrategy,
       "executionWorkspacePolicy.workspaceStrategy",
+      commands,
     ),
     ...collectWorkspaceRuntimeCommandPaths(
       policy.workspaceRuntime,
       "executionWorkspacePolicy.workspaceRuntime",
+      commands,
     ),
   ];
+}
+
+export function collectProjectExecutionWorkspaceCommandMutationPaths(before: unknown, after: unknown): string[] {
+  const beforeCommands = new Map<string, unknown>();
+  const afterCommands = new Map<string, unknown>();
+  collectProjectExecutionWorkspaceCommandPaths(before, beforeCommands);
+  collectProjectExecutionWorkspaceCommandPaths(after, afterCommands);
+  return [...new Set([...beforeCommands.keys(), ...afterCommands.keys()])].filter((path) =>
+    beforeCommands.has(path) !== afterCommands.has(path)
+    || !isDeepStrictEqual(beforeCommands.get(path), afterCommands.get(path)),
+  );
 }
 
 export function collectProjectWorkspaceCommandPaths(
