@@ -1,11 +1,12 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter, once } from "node:events";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { resetPiModelsCacheForTests } from "./models.js";
 
-// Fake `pi`: lists five models (not "mock/gone" or "mock/missing") and answers per --model.
+// Fake `pi`: lists available models (not "mock/gone" or "mock/missing") and answers per --model.
 // Each invocation is appended to calls.log as one JSON line.
 const FAKE_PI = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
@@ -18,14 +19,17 @@ fs.appendFileSync(path.join(__dirname, "env-probes.log"), JSON.stringify({
 }) + "\n");
 if (args.includes("--list-models")) {
   if (fs.existsSync(path.join(__dirname, "list-fails"))) process.exit(1);
-  process.stderr.write("provider  model  context\nmock  quota  1M\nmock  flaky  1M\nmock  good  1M\nmock  badauth  1M\nmock  bigtool  1M\nmock  killed  1M\nmock  killedsession  1M\n");
+  process.stderr.write("provider  model  context\nmock  quota  1M\nmock  flaky  1M\nmock  good  1M\nmock  badauth  1M\nmock  bigtool  1M\nmock  killed  1M\nmock  killedsession  1M\nmock  lostsession  1M\n");
   process.exit(0);
 }
 const arg = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : ""; };
 const model = arg("--model");
 fs.appendFileSync(path.join(__dirname, "calls.log"), JSON.stringify({ model, session: arg("--session"), prompt: args[args.length - 1] }) + "\n");
 const out = (event) => process.stdout.write(JSON.stringify(event) + "\n");
-const fail = (errorMessage) => out({ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage, content: [] } });
+const fail = (errorMessage) => {
+  out({ type: "usage", usage: { input: 2, output: 3, cacheRead: 1, cost: { total: 0.25 } } });
+  out({ type: "message_end", message: { role: "assistant", stopReason: "error", errorMessage, content: [] } });
+};
 if (model === "quota") {
   out({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "ls" } });
   out({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash", result: "ok" });
@@ -40,6 +44,10 @@ else if (model === "killed") {
 else if (model === "killedsession") {
   process.stderr.write("session not found\n");
   process.exit(143);
+}
+else if (model === "lostsession") {
+  process.stderr.write("session not found\n");
+  process.exit(1);
 }
 else if (model === "bigtool") {
   // A tool runs, then over 4 MB of streaming updates push it out of the
@@ -86,7 +94,12 @@ beforeEach(async () => {
   await fs.rm(path.join(root, "bin", "env-probes.log"), { force: true });
 });
 
-async function run(config: Record<string, unknown>, sessionId?: string, authToken?: string) {
+async function run(
+  config: Record<string, unknown>,
+  sessionId?: string,
+  control: Pick<AdapterExecutionContext, "signal" | "onCancellationReady" | "onSpawn" | "onLog"> = { onLog: async () => {} },
+  authToken?: string,
+) {
   const logs: string[] = [];
   const workspace = path.join(root, "workspace");
   await fs.mkdir(workspace, { recursive: true });
@@ -97,8 +110,10 @@ async function run(config: Record<string, unknown>, sessionId?: string, authToke
     runtime: { sessionId: sessionId ?? null, sessionParams: null, sessionDisplayId: null, taskKey: null },
     config: { command: fakePi, ...config },
     context: { paperclipWorkspace: { cwd: workspace, source: "project_primary" } },
-    onLog: async (_stream: string, chunk: string) => {
+    ...control,
+    onLog: async (_stream: "stdout" | "stderr", chunk: string) => {
       logs.push(chunk);
+      await control.onLog(_stream, chunk);
     },
   } as unknown as AdapterExecutionContext);
   const calls = (await fs.readFile(path.join(root, "bin", "calls.log"), "utf8").catch(() => ""))
@@ -130,7 +145,7 @@ describe("pi child environment", () => {
           PAPERCLIP_TASK_ID: "task-env-probe",
           PAPERCLIP_CALLER_ENV: "run-only",
         },
-      }, undefined, "test-only-run-token");
+      }, undefined, undefined, "test-only-run-token");
       expect(result.exitCode).toBe(0);
       const probes = (await fs.readFile(path.join(root, "bin", "env-probes.log"), "utf8"))
         .trim().split("\n")
@@ -155,6 +170,101 @@ describe("pi child environment", () => {
 });
 
 describe("pi model fallback chain", () => {
+  it("does not start provider work when already cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const onCancellationReady = vi.fn(async () => {});
+    const { result, calls } = await run({ model: "mock/good" }, undefined, {
+      signal: controller.signal,
+      onCancellationReady,
+      onLog: async () => {},
+    });
+    expect(calls).toEqual([]);
+    expect(onCancellationReady).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ exitCode: null, signal: null, timedOut: false });
+  });
+
+  it("awaits cancellation readiness before the first provider spawn", async () => {
+    const controller = new AbortController();
+    let ready = false;
+    const barrier = new EventEmitter();
+    const reachedReadinessOrSpawn = once(barrier, "reached");
+    const released = once(barrier, "release");
+    const readinessAtSpawn: boolean[] = [];
+    const onCancellationReady = vi.fn(async () => {
+      barrier.emit("reached");
+      await released;
+      ready = true;
+    });
+    const pending = run({ model: "mock/good" }, undefined, {
+      signal: controller.signal,
+      onCancellationReady,
+      onSpawn: async () => {
+        readinessAtSpawn.push(ready);
+        barrier.emit("reached");
+      },
+      onLog: async () => {},
+    });
+    await reachedReadinessOrSpawn;
+    barrier.emit("release");
+    const { result, calls } = await pending;
+    expect(readinessAtSpawn).toEqual([true]);
+    expect(onCancellationReady).toHaveBeenCalledTimes(1);
+    expect(calls.map((call) => call.model)).toEqual(["good"]);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("does not fall back after cancellation during a transient provider failure", async () => {
+    const controller = new AbortController();
+    const onCancellationReady = vi.fn(async () => {});
+    const { result, calls, cooldowns } = await run({ model: "mock/flaky", fallbackModels: ["mock/good"] }, undefined, {
+      signal: controller.signal,
+      onCancellationReady,
+      onLog: async (_stream, chunk) => {
+        if (chunk.includes("503 Service Unavailable")) controller.abort();
+      },
+    });
+    expect(controller.signal.aborted).toBe(true);
+    expect(calls.map((call) => call.model)).toEqual(["flaky"]);
+    expect(result).toMatchObject({ exitCode: 1, errorFamily: "transient_upstream", model: "mock/flaky" });
+    expect(cooldowns).toEqual({});
+    expect(onCancellationReady).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves run totals when cancellation stops a later fallback", async () => {
+    const controller = new AbortController();
+    const { result, calls } = await run({ model: "mock/quota", fallbackModels: ["mock/flaky", "mock/good"] }, undefined, {
+      signal: controller.signal,
+      onCancellationReady: vi.fn(async () => {}),
+      onLog: async (_stream, chunk) => {
+        if (chunk.includes("503 Service Unavailable")) controller.abort();
+      },
+    });
+    expect(calls.map((call) => call.model)).toEqual(["quota", "flaky"]);
+    expect(result).toMatchObject({ exitCode: 1, model: "mock/flaky", usage: { inputTokens: 4, outputTokens: 6, cachedInputTokens: 2 }, costUsd: 0.5 });
+    expect(result.resultJson).toMatchObject({ modelAttempts: [{ model: "mock/quota" }, { model: "mock/flaky" }] });
+  });
+
+  it("does not retry a missing session after cancellation", async () => {
+    const workspace = path.join(root, "workspace");
+    await fs.mkdir(workspace, { recursive: true });
+    const sessionFile = path.join(root, "cancelled-session.jsonl");
+    await fs.writeFile(sessionFile, JSON.stringify({ type: "session", cwd: workspace }) + "\n");
+    const controller = new AbortController();
+    const { result, calls, log } = await run({ model: "mock/lostsession" }, sessionFile, {
+      signal: controller.signal,
+      onCancellationReady: vi.fn(async () => {}),
+      onLog: async (_stream, chunk) => {
+        if (chunk.includes("session not found")) controller.abort();
+      },
+    });
+    expect(controller.signal.aborted).toBe(true);
+    expect(calls.map((call) => call.session)).toEqual([sessionFile]);
+    expect(log).not.toContain("retrying with a fresh session");
+    expect(result.exitCode).toBe(1);
+    expect(result.clearSession).toBe(false);
+  });
+
   it("falls back down the chain in the same session and reports the model that ran", async () => {
     const { result, calls, cooldowns, log } = await run({
       model: "mock/quota",

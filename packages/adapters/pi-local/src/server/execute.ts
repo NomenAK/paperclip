@@ -914,13 +914,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const isAttemptFailed = (attempt: PiAttempt) =>
       !attempt.proc.timedOut && ((attempt.proc.exitCode ?? 0) !== 0 || attempt.parsed.errors.length > 0);
-    // A Pi process stopped by the control plane (run cancelled or reassigned:
-    // a signal, or exit 143 = SIGTERM / 130 = SIGINT) is neither a provider
-    // outage nor a lost session: never respawn it under the same run.
-    const isAttemptStopped = (attempt: PiAttempt) =>
+    // Fallback heuristic for stops outside signal-based cancellation (including
+    // local kills). A signal or exit 143/130 is not proof of control-plane
+    // cancellation, but still must not respawn the stopped process.
+    const isAttemptStoppedHeuristic = (attempt: PiAttempt) =>
       attempt.proc.signal !== null || attempt.proc.exitCode === 143 || attempt.proc.exitCode === 130;
 
     try {
+      // Heartbeat derives the cancelled outcome from ctx.signal, not an exit
+      // code or a fabricated process signal when no provider process ran.
+      const cancelledBeforeStart: AdapterExecutionResult = { exitCode: null, signal: null, timedOut: false };
+      await ctx.onCancellationReady?.();
+      if (ctx.signal?.aborted) return cancelledBeforeStart;
       const cooldownStore = createPiModelCooldownStore();
       const plan = planPiModelAttempts(modelChain, await cooldownStore.read(), new Date());
       for (const { model: skippedModel, cooldown } of plan.skipped) {
@@ -978,6 +983,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       const unlistedModels: string[] = [];
       for (const [index, candidate] of candidates.entries()) {
+        if (ctx.signal?.aborted) return lastResult ? withRunTotals(lastResult) : cancelledBeforeStart;
         const nextCandidate = candidates[index + 1] ?? null;
         if (!executionTargetIsRemote) {
           try {
@@ -1015,12 +1021,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }
         }
 
+        if (ctx.signal?.aborted) return lastResult ? withRunTotals(lastResult) : cancelledBeforeStart;
         let attempt = await runAttempt(attemptSessionPath, candidate, attemptPrompt);
         if (
+          !ctx.signal?.aborted &&
           !lastResult &&
           canResumeSession &&
           isAttemptFailed(attempt) &&
-          !isAttemptStopped(attempt) &&
+          !isAttemptStoppedHeuristic(attempt) &&
           isPiUnknownSessionError(attempt.proc.stdout, attempt.rawStderr)
         ) {
           await onLog(
@@ -1047,9 +1055,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               }
             }
           }
-          attemptSessionPath = newSessionPath;
-          sessionReset = true;
-          attempt = await runAttempt(attemptSessionPath, candidate, attemptPrompt);
+          if (!ctx.signal?.aborted) {
+            attemptSessionPath = newSessionPath;
+            sessionReset = true;
+            attempt = await runAttempt(attemptSessionPath, candidate, attemptPrompt);
+          }
         }
 
         providerWorkStarted ||= attempt.toolStarted;
@@ -1062,6 +1072,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
         lastResult = result;
 
+        if (ctx.signal?.aborted) return withRunTotals(result);
         if (result.timedOut) return withRunTotals(result);
         if ((result.exitCode ?? 0) === 0) {
           await cooldownStore.recordSuccess(candidate);
@@ -1070,7 +1081,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }
           return withRunTotals(result);
         }
-        if (isAttemptStopped(attempt)) return withRunTotals(result);
+        if (isAttemptStoppedHeuristic(attempt)) return withRunTotals(result);
         // Only provider availability failures move down the chain; anything
         // else (auth, prompt, tool or agent errors) is the run's real outcome.
         if (result.errorFamily !== "provider_quota" && result.errorFamily !== "transient_upstream") {
@@ -1082,6 +1093,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           retryNotBefore: result.retryNotBefore ? new Date(result.retryNotBefore) : null,
           reason: result.errorMessage ?? result.errorFamily,
         });
+        if (ctx.signal?.aborted) return withRunTotals(result);
         if (!nextCandidate) break;
         await onLog(
           "stdout",
