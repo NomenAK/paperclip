@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { resetPiModelsCacheForTests } from "./models.js";
 
@@ -11,6 +11,11 @@ const FAKE_PI = String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
 const args = process.argv.slice(2);
+fs.appendFileSync(path.join(__dirname, "env-probes.log"), JSON.stringify({
+  kind: args.includes("--list-models") ? "models" : "agent",
+  keys: Object.keys(process.env),
+  runtime: Object.fromEntries(["PATH", "HOME", "PAPERCLIP_API_URL", "PAPERCLIP_API_KEY", "PAPERCLIP_TASK_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_CALLER_ENV"].map((key) => [key, process.env[key]])),
+}) + "\n");
 if (args.includes("--list-models")) {
   if (fs.existsSync(path.join(__dirname, "list-fails"))) process.exit(1);
   process.stderr.write("provider  model  context\nmock  quota  1M\nmock  flaky  1M\nmock  good  1M\nmock  badauth  1M\nmock  bigtool  1M\nmock  killed  1M\nmock  killedsession  1M\n");
@@ -78,14 +83,16 @@ beforeEach(async () => {
   await fs.rm(path.join(root, "bin", "list-fails"), { force: true });
   await fs.rm(cooldownsFile, { force: true });
   await fs.rm(path.join(root, "bin", "calls.log"), { force: true });
+  await fs.rm(path.join(root, "bin", "env-probes.log"), { force: true });
 });
 
-async function run(config: Record<string, unknown>, sessionId?: string) {
+async function run(config: Record<string, unknown>, sessionId?: string, authToken?: string) {
   const logs: string[] = [];
   const workspace = path.join(root, "workspace");
   await fs.mkdir(workspace, { recursive: true });
   const result = await execute({
     runId: "run-1",
+    authToken,
     agent: { id: "agent-1", companyId: "company-1", name: "Pi", adapterType: "pi_local", adapterConfig: {} },
     runtime: { sessionId: sessionId ?? null, sessionParams: null, sessionDisplayId: null, taskKey: null },
     config: { command: fakePi, ...config },
@@ -101,6 +108,51 @@ async function run(config: Record<string, unknown>, sessionId?: string) {
   const cooldowns = JSON.parse(await fs.readFile(cooldownsFile, "utf8").catch(() => "{}"));
   return { result, calls, cooldowns, log: logs.join("") };
 }
+
+describe("pi child environment", () => {
+  it("isolates server secrets while preserving inherited and run-scoped env", async () => {
+    const serverOnlyKeys = [
+      "PAPERCLIP_AGENT_JWT_SECRET",
+      "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+      "PAPERCLIP_DECISION_SIGNING_SECRET",
+      "PAPERCLIP_SECRETS_MASTER_KEY",
+      "DATABASE_URL",
+      "PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET",
+      "BETTER_AUTH_SECRET",
+      "PAPERCLIP_FOO",
+    ];
+    for (const key of serverOnlyKeys) vi.stubEnv(key, "test-only-server-value");
+    vi.stubEnv("PAPERCLIP_RUNTIME_API_URL", "http://127.0.0.1:4321");
+    try {
+      const { result } = await run({
+        model: "mock/good",
+        env: {
+          PAPERCLIP_TASK_ID: "task-env-probe",
+          PAPERCLIP_CALLER_ENV: "run-only",
+        },
+      }, undefined, "test-only-run-token");
+      expect(result.exitCode).toBe(0);
+      const probes = (await fs.readFile(path.join(root, "bin", "env-probes.log"), "utf8"))
+        .trim().split("\n")
+        .map((line) => JSON.parse(line) as { kind: string; keys: string[]; runtime: Record<string, string> });
+      expect(probes.map((probe) => probe.kind)).toEqual(["models", "agent"]);
+      for (const probe of probes) {
+        expect(probe.keys.filter((key) => serverOnlyKeys.includes(key))).toEqual([]);
+        expect(probe.runtime.HOME).toBe(root);
+        expect(probe.runtime.PATH.split(path.delimiter)).toEqual(expect.arrayContaining(process.env.PATH!.split(path.delimiter)));
+        expect(probe.runtime).toMatchObject({
+          PAPERCLIP_API_URL: "http://127.0.0.1:4321",
+          PAPERCLIP_API_KEY: "test-only-run-token",
+          PAPERCLIP_TASK_ID: "task-env-probe",
+          PAPERCLIP_RUN_ID: "run-1",
+          PAPERCLIP_CALLER_ENV: "run-only",
+        });
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
 
 describe("pi model fallback chain", () => {
   it("falls back down the chain in the same session and reports the model that ran", async () => {

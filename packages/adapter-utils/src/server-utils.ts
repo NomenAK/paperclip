@@ -3417,12 +3417,16 @@ export function sanitizeInheritedPaperclipEnv(
   return env;
 }
 
-// Instance signing secrets: holding one lets a process mint agent JWTs, sign
-// tool actions, or forge board sessions. No agent process may ever inherit them,
-// whether from the server environment or from adapter-provided env.
+// Instance secrets grant control-plane signing, database, encryption, or OAuth
+// authority. No agent process may ever inherit them, whether from the server
+// environment or from adapter-provided env.
 export const INSTANCE_SIGNING_SECRET_ENV_KEYS = [
   "PAPERCLIP_AGENT_JWT_SECRET",
   "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+  "PAPERCLIP_DECISION_SIGNING_SECRET",
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "DATABASE_URL",
+  "PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET",
   "BETTER_AUTH_SECRET",
 ] as const;
 
