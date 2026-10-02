@@ -3403,6 +3403,15 @@ export function sanitizeInheritedPaperclipEnv(
   return env;
 }
 
+// Instance signing secrets: holding one lets a process mint agent JWTs, sign
+// tool actions, or forge board sessions. No agent process may ever inherit them,
+// whether from the server environment or from adapter-provided env.
+export const INSTANCE_SIGNING_SECRET_ENV_KEYS = [
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+  "BETTER_AUTH_SECRET",
+] as const;
+
 export function defaultPathForPlatform() {
   if (process.platform === "win32") {
     return "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem";
@@ -4600,6 +4609,9 @@ export async function runChildProcess(
       "CLAUDE_CODE_PARENT_SESSION",
     ] as const;
     for (const key of CLAUDE_CODE_NESTING_VARS) {
+      delete rawMerged[key];
+    }
+    for (const key of INSTANCE_SIGNING_SECRET_ENV_KEYS) {
       delete rawMerged[key];
     }
 
