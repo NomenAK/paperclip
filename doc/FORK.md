@@ -35,8 +35,16 @@ Paperclip (`deploy` on `v2026.1001.0`, oldest first):
 | `03154f86a` | fork tooling: `scripts/fork/pack-fork.sh` | fork |
 | `63069cda0` | fork tooling: `scripts/fork/install-fork.sh` | fork |
 | `f2ab4164e` | this document | fork |
+| `bb28b49a8` | Pi Durable adapter assessment (`doc/plans/`) | fork |
+| `bcaf96555` | pi-local: build agent env from the sanitized server env; denylist all instance secrets (`PAPERCLIP_DECISION_SIGNING_SECRET`, `PAPERCLIP_SECRETS_MASTER_KEY`, `DATABASE_URL`, `PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET` added) | Sauron audit A1 (root fix for DIO-457/475) |
+| `52c21e80f` | pi-local: opt into `onCancellationReady` and honour `ctx.signal` between attempts; exit 143/130 kept as fallback heuristic | Sauron audit A2 (root fix for DIO-443) |
+| `9723a146c` | authz: compare host commands before/after a policy replacement instead of blocking every agent policy edit | Sauron audit A3 (refines DIO-63) |
+| `3fb519843` | adapter-utils: managed shell profiles prepend to the live `PATH` instead of restoring a frozen one | Sauron audit A4 (DIO-90) |
+| `7f41c8707` | skills: `SKILL.md` resolves `paperclip-issue-update.sh` against the skill directory | Sauron audit A5 (DIO-210) |
 
-Previous stack (on `v2026.916.1`): tag `deploy/2026.916.1-nomenak.1`.
+Previous stacks: tags `deploy/2026.916.1-nomenak.1` (on `v2026.916.1`) and
+`deploy/2026.1001.0-nomenak.1` (before the audit fixes). Audit:
+`~/paperclip-audits/sauron-2026-10-02.md`.
 
 Commit `b2a7a4bea` ("treat models missing from the catalogue as a soft
 cooldown") was never deployed. It is kept on branch
@@ -61,8 +69,16 @@ pi-cliproxyapi-provider (`deploy` on master `4b87e14` = 0.15.50):
   The systemd drop-in
   `~/.config/systemd/user/paperclipai.service.d/override.conf` runs
   `current/install/node_modules/paperclipai/dist/index.js`. The `paperclipai`
-  command on `PATH` links to the same file. Fork versions are
-  `<upstream version>-nomenak.<n>`.
+  command on `PATH` links to the same file. The agents' Pi skill link
+  `~/.pi/agent/skills/paperclip` points through `current`, so it follows each
+  install. Fork versions are `<upstream version>-nomenak.<n>`.
+- Restart: `paperclipai service restart` hot-restarts and **adopts** live
+  agent runs (`KillMode=process` in the drop-in keeps their processes alive;
+  verified 2026-10-02, report `adoptedRunIds`, `lostRunIds` empty). Check
+  `~/.paperclip/instances/default/hot-restart-report.json` after each restart:
+  any `lostRunIds` entry is a failed restart. `--wait` drains instead.
+- The drop-in `PATH` includes `~/.dotnet/tools` (ilspycmd); `pwsh` comes from
+  global mise (`~/.config/mise/config.toml`).
 - Pi: `npm install -g ~/.local/share/pi-fork/<tarball>`; `pi --version` shows
   the `-nomenak.<n>` suffix.
 - pi-cliproxyapi-provider: pinned git package in `~/.pi/agent/settings.json`
@@ -79,7 +95,7 @@ Paperclip (example: from `v2026.1001.0` to `vNEXT`):
 ```bash
 cd ~/Dev/paperclip-pi-parser
 git fetch upstream --tags
-git tag deploy/2026.1001.0-nomenak.1 deploy && git push origin deploy/2026.1001.0-nomenak.1
+git tag deploy/<current version> deploy && git push origin deploy/<current version>   # e.g. deploy/2026.1001.0-nomenak.2
 git switch -c deploy-NEXT deploy
 git rebase --onto vNEXT v2026.1001.0   # resolve conflicts per commit; drop commits upstream merged
 pnpm install --frozen-lockfile
@@ -87,8 +103,8 @@ pnpm -r typecheck && pnpm test:run
 scripts/fork/pack-fork.sh NEXT-nomenak.1
 scripts/fork/install-fork.sh NEXT-nomenak.1   # moves `current`
 paperclipai db:backup
-# board-gated: no run in progress (heartbeat_runs.status running/queued = 0)
-systemctl --user restart paperclipai.service   # applies pending DB migrations on start
+# board-gated; hot restart adopts live runs and applies pending DB migrations on start
+paperclipai service restart --json | jq '.report | {adoptedRunIds, lostRunIds}'   # lostRunIds must be empty
 git branch -f deploy deploy-NEXT && git switch deploy && git branch -D deploy-NEXT
 git push -f origin deploy vNEXT
 ```
