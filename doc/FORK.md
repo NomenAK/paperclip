@@ -72,11 +72,12 @@ pi-cliproxyapi-provider (`deploy` on master `4b87e14` = 0.15.50):
   command on `PATH` links to the same file. The agents' Pi skill link
   `~/.pi/agent/skills/paperclip` points through `current`, so it follows each
   install. Fork versions are `<upstream version>-nomenak.<n>`.
-- Restart: `paperclipai service restart` hot-restarts and **adopts** live
-  agent runs (`KillMode=process` in the drop-in keeps their processes alive;
-  verified 2026-10-02, report `adoptedRunIds`, `lostRunIds` empty). Check
-  `~/.paperclip/instances/default/hot-restart-report.json` after each restart:
-  any `lostRunIds` entry is a failed restart. `--wait` drains instead.
+- Restart **after a drain** (`~/.local/bin/paperclip-drain-restart`, see the
+  ops runbook). Do not rely on `paperclipai service restart` hot-restart
+  adoption for `pi_local`: tested 2026-10-02 (DIO-487), the run was reported
+  as adopted but the Pi process died with EPIPE on its next stdout write (its
+  pipes belonged to the old server) and ended `orphaned_running_run`. The
+  service keeps the default `KillMode` (`control-group`).
 - The drop-in `PATH` includes `~/.dotnet/tools` (ilspycmd); `pwsh` comes from
   global mise (`~/.config/mise/config.toml`).
 - Pi: `npm install -g ~/.local/share/pi-fork/<tarball>`; `pi --version` shows
@@ -103,8 +104,8 @@ pnpm -r typecheck && pnpm test:run
 scripts/fork/pack-fork.sh NEXT-nomenak.1
 scripts/fork/install-fork.sh NEXT-nomenak.1   # moves `current`
 paperclipai db:backup
-# board-gated; hot restart adopts live runs and applies pending DB migrations on start
-paperclipai service restart --json | jq '.report | {adoptedRunIds, lostRunIds}'   # lostRunIds must be empty
+# board-gated; drain then restart (applies pending DB migrations on start)
+~/.local/bin/paperclip-drain-restart --timeout-min 20
 git branch -f deploy deploy-NEXT && git switch deploy && git branch -D deploy-NEXT
 git push -f origin deploy vNEXT
 ```
