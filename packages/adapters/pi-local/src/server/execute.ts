@@ -909,6 +909,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const isAttemptFailed = (attempt: PiAttempt) =>
       !attempt.proc.timedOut && ((attempt.proc.exitCode ?? 0) !== 0 || attempt.parsed.errors.length > 0);
+    // A Pi process stopped by the control plane (run cancelled or reassigned:
+    // a signal, or exit 143 = SIGTERM / 130 = SIGINT) is neither a provider
+    // outage nor a lost session: never respawn it under the same run.
+    const isAttemptStopped = (attempt: PiAttempt) =>
+      attempt.proc.signal !== null || attempt.proc.exitCode === 143 || attempt.proc.exitCode === 130;
 
     try {
       const cooldownStore = createPiModelCooldownStore();
@@ -1011,6 +1016,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           !lastResult &&
           canResumeSession &&
           isAttemptFailed(attempt) &&
+          !isAttemptStopped(attempt) &&
           isPiUnknownSessionError(attempt.proc.stdout, attempt.rawStderr)
         ) {
           await onLog(
@@ -1060,6 +1066,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           }
           return withRunTotals(result);
         }
+        if (isAttemptStopped(attempt)) return withRunTotals(result);
         // Only provider availability failures move down the chain; anything
         // else (auth, prompt, tool or agent errors) is the run's real outcome.
         if (result.errorFamily !== "provider_quota" && result.errorFamily !== "transient_upstream") {
