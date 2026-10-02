@@ -1,5 +1,8 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { access, readFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as ssh from "./ssh.js";
 import * as serverUtils from "./server-utils.js";
@@ -408,6 +411,60 @@ describe("resolveAdapterExecutionTargetCwd", () => {
 
 
 describe("GitHub launcher lifecycle", () => {
+  // A pipe/socket stdin makes Bash select its remote-daemon startup path.
+  const exec = (command: string, args: string[], env: Record<string, string>) =>
+    execFileSync(command, args, { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+
+  it("generates shell profiles that extend the current PATH instead of freezing the launch PATH", async () => {
+    const input = { runId: randomUUID(), target: null };
+    try {
+      const env = await prepareGitHubOperationLaunchers({ ...input, cwd: "/tmp", env: { PATH: "/launch-only/bin" } });
+      for (const name of [".bashrc", ".bash_profile", ".profile", ".zshenv", ".zprofile", ".zshrc"]) {
+        const profile = await readFile(path.join(env.PAPERCLIP_GITHUB_LAUNCHER_DIR, name), "utf8");
+        expect(profile).not.toContain("/launch-only/bin");
+        expect(profile).toContain('"$PATH"');
+        expect(profile).toContain('case ":$PATH:" in');
+      }
+    } finally {
+      await cleanupGitHubOperationLaunchers(input);
+    }
+  });
+
+  it("preserves caller PATH changes through BASH_ENV and repeated profile sourcing with safely quoted directories", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-profile-"));
+    const launcherRoot = path.join(root, "managed dir ' [*] $");
+    await mkdir(launcherRoot);
+    const input = { runId: randomUUID(), target: null };
+    vi.stubEnv("TMPDIR", launcherRoot);
+    try {
+      const env = await prepareGitHubOperationLaunchers({ ...input, cwd: root, env: { PATH: "/launch-only/bin" } });
+      const directory = env.PAPERCLIP_GITHUB_LAUNCHER_DIR;
+      const callerPath = "/caller marker/bin:/usr/bin:/bin";
+      const profilePath = path.join(root, "profile");
+      await writeFile(profilePath, await readFile(env.BASH_ENV));
+      const shellEnv = { PATH: callerPath, BASH_ENV: profilePath };
+      const initial = exec("/bin/bash", ["-c", 'echo "$PATH"'], shellEnv);
+      expect(initial.split(":")).toEqual([directory, "/caller marker/bin", "/usr/bin", "/bin"]);
+
+      const repeated = exec("/bin/bash", ["-c", '. "$BASH_ENV"; . "$BASH_ENV"; echo "$PATH"'], shellEnv);
+      expect(repeated).toBe(initial);
+
+      const modified = exec("/bin/bash", ["-c", '. "$BASH_ENV"; echo "$PATH"'], {
+        ...shellEnv, PATH: `/activated-venv/bin:${initial}`,
+      });
+      expect(modified).toBe(`/activated-venv/bin:${initial}`);
+
+      const posix = exec("/bin/sh", ["-c", '. "$1"; . "$1"; echo "$PATH"', "sh", path.join(directory, ".profile")], {
+        PATH: callerPath,
+      });
+      expect(posix).toBe(initial);
+    } finally {
+      await cleanupGitHubOperationLaunchers(input);
+      vi.unstubAllEnvs();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("removes only the completed run's launchers and leaves concurrent runs usable", async () => {
     const first = { runId: randomUUID(), target: null };
     const second = { runId: randomUUID(), target: null };

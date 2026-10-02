@@ -1708,15 +1708,15 @@ export async function prepareGitHubOperationLaunchers(input: {
   const configDirectory = path.posix.join(directory, "gh-config");
   const basePath = await githubOperationLauncherBasePath(remote, input.env);
   const managedPath = basePath ? `${directory}:${basePath}` : directory;
-  // Login shells may reorder PATH through /etc/profile or path_helper. Restore
-  // the managed launchers after startup without loading a host user's profile.
+  // Add missing managed launchers without resetting caller PATH changes or
+  // duplicating entries when Bash/Zsh source multiple startup profiles.
   // Empty merge overrides clear host identity before launch, but Git treats
   // them as an explicit empty author. Remove them once the shell has inherited
   // its final environment; preserve nonempty per-operation identity values.
   const clearEmptyGitIdentity = ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]
     .map((key) => `if [ -z "\${${key}-}" ]; then unset ${key}; fi\n`)
     .join("");
-  const profile = `export PATH=${shellQuote(managedPath)}\n${clearEmptyGitIdentity}`;
+  const profile = `case ":$PATH:" in\n  *${shellQuote(`:${directory}:`)}*) ;;\n  *) export PATH=${shellQuote(`${directory}:`)}"$PATH" ;;\nesac\n${clearEmptyGitIdentity}`;
   const files: Record<string, string> = Object.fromEntries([
     // Remote launchers live beneath the checkout. Pin their own package scope
     // so an enclosing project's "type": "module" cannot reinterpret require().
