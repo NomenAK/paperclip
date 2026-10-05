@@ -9,8 +9,8 @@ Nothing is hand-patched in `dist/` or in installed packages any more.
 | Repository | Fork | `deploy` base | Local checkout |
 | --- | --- | --- | --- |
 | paperclipai/paperclip | NomenAK/paperclip | `v2026.1001.0` | `~/Dev/paperclip-pi-parser` |
-| earendil-works/pi | NomenAK/pi | `v1.0.0` | `~/Dev/pi-deploy` (worktree of `~/Dev/pi`) |
-| 0xRichardH/pi-cliproxyapi-provider | NomenAK/pi-cliproxyapi-provider | `v0.15.50` (master `4b87e14`) | `~/Dev/pi-cliproxyapi-provider` |
+| earendil-works/pi | NomenAK/pi | `v1.0.3` | `~/Dev/pi-deploy` (worktree of `~/Dev/pi`) |
+| 0xRichardH/pi-cliproxyapi-provider | NomenAK/pi-cliproxyapi-provider | `v0.15.54` (master `d18bb8d`) | `~/Dev/pi-cliproxyapi-provider` |
 
 Remotes in every checkout: `origin` = fork, `upstream` = original project
 (push disabled).
@@ -46,21 +46,34 @@ Previous stacks: tags `deploy/2026.916.1-nomenak.1` (on `v2026.916.1`) and
 `deploy/2026.1001.0-nomenak.1` (before the audit fixes). Audit:
 `~/paperclip-audits/sauron-2026-10-02.md`.
 
+Tag `deploy/2026.1001.0-nomenak.2` points at `557e42614`, one commit before
+the `deploy` tip (`852bf0c37`, the drain/hot-restart doc note). It is left
+where it is: the tag is a snapshot, not the branch head, so it does not follow
+`deploy` forward.
+
 Commit `b2a7a4bea` ("treat models missing from the catalogue as a soft
 cooldown") was never deployed. It is kept on branch
 `deploy-with-soft-cooldown` and is not part of `deploy`.
 
-Pi (`deploy` on `v1.0.0`; previous stack: tag `deploy/0.87.1-nomenak.1`):
+Pi (`deploy` on `v1.0.3`; previous stacks: tags `deploy/0.87.1-nomenak.1` and
+`deploy/1.0.0-nomenak.1`):
 
 | Commit | Change |
 | --- | --- |
-| `d0ff703b0` | ai: retry OpenRouter "Error injected into SSE stream" failures |
+| `2fda9c4cf` | ai: retry OpenRouter "Error injected into SSE stream" failures |
 
-pi-cliproxyapi-provider (`deploy` on master `4b87e14` = 0.15.50):
+`2fda9c4cf` is the `d0ff703b0` patch rebased onto `v1.0.3` (2026-10-05). Still
+unmerged upstream: `v1.0.3` has no "injected into SSE" retry pattern.
+
+pi-cliproxyapi-provider (`deploy` on master `d18bb8d` = 0.15.54):
 
 | Commit | Change |
 | --- | --- |
-| `fa134b7` | matching: index the models.dev catalog (slow pi startup) |
+| `93df226` | matching: index the models.dev catalog (slow pi startup) |
+
+`93df226` is the `fa134b7` patch rebased onto `d18bb8d` (2026-10-05). Still
+unmerged upstream: upstream never touched `src/matching.ts`, which still
+scans the catalog with `Object.keys()`.
 
 ## Install layout
 
@@ -83,7 +96,8 @@ pi-cliproxyapi-provider (`deploy` on master `4b87e14` = 0.15.50):
 - Pi: `npm install -g ~/.local/share/pi-fork/<tarball>`; `pi --version` shows
   the `-nomenak.<n>` suffix.
 - pi-cliproxyapi-provider: pinned git package in `~/.pi/agent/settings.json`
-  (`git:github.com/NomenAK/pi-cliproxyapi-provider@<sha>`).
+  (`git:github.com/NomenAK/pi-cliproxyapi-provider@<sha>`). Pinned at
+  `93df2265ee1c674c9c4458cb33081f13d97fc4c7` since 2026-10-05.
 
 Never run `npm install -g paperclipai`, `paperclipai install/upgrade` or
 `npm install -g @earendil-works/pi-coding-agent`. Each of them replaces the
@@ -119,14 +133,26 @@ new one has run clean. Each version directory takes 1.4 to 1.6 GB.
 
 Pi: tag the current `deploy` (`deploy/<ver>-nomenak.<n>`), then rebase
 `deploy` onto the new tag in `~/Dev/pi-deploy`. Then run
-`npm ci && npm run build`. In `packages/coding-agent`, run
-`npm run shrinkwrap`, then set `"version"` in `package.json` to
-`<ver>-nomenak.<n>`. Edit the file with `jq`: `npm version` fails because
-the repo `.npmrc` sets `min-release-age=2`. Then run
+`npm ci && npm run build`. In `packages/coding-agent`, set `"version"` in
+`package.json` to `<ver>-nomenak.<n>`. Edit the file with `jq`: `npm version`
+fails because the repo `.npmrc` sets `min-release-age=2`. Then run
 `npm pack --pack-destination ~/.local/share/pi-fork`, run `npm install -g` on
 the tarball, and finish with `git checkout -- .`. Before switching, compare
 `pi --mode json -p` events and `pi --list-models` output between the old and
 new builds: the pi-local adapter parses both.
+
+Do not run `npm run shrinkwrap`: upstream removed it in `581e7ba78` ("remove
+npm shrinkwrap and recommend the managed installer") and dropped
+`npm-shrinkwrap.json` from the package `files`. The script is absent from
+`v1.0.1` onwards, and `npm pack` works without it.
+
+Capture the "before" JSON event stream with a model that answers, e.g.
+`pi --mode json -p "say hi" --model cpa/gpt-6-luna` (the flag is `--model`,
+not `-m`). The default `xiaomi-token-plan-ams/mimo-v2.5-pro` was quota-exhausted
+on 2026-10-05, which turns the capture into ~7 minutes of `auto_retry_start`
+events and never reaches `auto_retry_end` or `agent_settled`. Allow the whole
+retry chain to finish before diffing, or the missing terminal events look like
+a schema change.
 
 pi-cliproxyapi-provider: rebase `deploy` onto `upstream/master`, run
 `npm run check`, push. Then run
